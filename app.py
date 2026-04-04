@@ -882,9 +882,9 @@ with tab2:
         if True:  # groww data always available
             with st.spinner("Fetching live quote…"):
                 sym = trade_q.strip().upper().replace(" ","")
-                sq  = get_stock_quote(kite, sym)
+                sq  = get_stock_quote_groww(get_groww_token(), sym)
                 if sq.get("success"):
-                    vix_d = get_vix_data(kite)
+                    vix_d = get_vix_data_groww(get_groww_token())
                     live_ctx = f"""LIVE MARKET DATA FOR {sym}:
 LTP: ₹{sq['last_price']:,.2f}  Change: {sq['change_pct']:+.2f}%
 O:{sq['open']}  H:{sq['high']}  L:{sq['low']}  PrevClose:{sq['close']}
@@ -1085,7 +1085,7 @@ with tab3:
                      "options_chain":"Max pain, PCR, gamma walls, OI at key strikes, IV skew, unusual activity."}[analytics_focus]
 
         live_inject = ""
-        if kite and "live_analytics_cache" in st.session_state:
+        if "live_analytics_cache" in st.session_state:
             ld2 = st.session_state["live_analytics_cache"]
             live_inject = build_market_context(ld2.get("indices",{}),ld2.get("vix",{}),ld2.get("options",{}),ld2.get("fii",{}))
 
@@ -1155,7 +1155,7 @@ Respond ONLY in valid JSON (no markdown):
 
     elif analytics_go:
         st.warning("Please enter an analytics query.")
-    elif not kite:
+    elif not get_groww_token():
         st.markdown('<div class="hero"><div class="hero-title">Market Analytics Engine</div><div class="hero-body">Connect Zerodha Kite in the sidebar for a live dashboard<br>or use the AI analytics query below without connection<br><span style="color:#B8C2D8;font-size:10px;">Try: "Nifty OI analysis" · "India VIX regime" · "BankNifty options chain"</span></div></div>',unsafe_allow_html=True)
 
 
@@ -1225,12 +1225,11 @@ with tab4:
     if not tg_token_sc or not tg_chat_sc:
         st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to Streamlit Secrets to enable the scanner.")
     else:
-        kite_sc = get_kite()
+        pass  # groww used directly
         scanner = get_scanner(
             api_key=api_key,
             telegram_token=tg_token_sc,
             telegram_chat_id=tg_chat_sc,
-            kite=kite_sc,
             groww_token=groww_tok_sc,
         )
 
