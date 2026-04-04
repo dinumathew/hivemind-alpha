@@ -1220,121 +1220,75 @@ with tab4:
 
     tg_token_sc  = st.secrets.get("TELEGRAM_BOT_TOKEN","")
     tg_chat_sc   = st.secrets.get("TELEGRAM_CHAT_ID","")
-    groww_tok_sc = st.secrets.get("GROWW_API_TOKEN","")
+    groww_tok_sc = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+    api_key_sc   = st.secrets.get("ANTHROPIC_API_KEY","") or st.session_state.get("api_key","")
+    scanner = get_scanner()
 
     if not tg_token_sc or not tg_chat_sc:
-        st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to Streamlit Secrets to enable the scanner.")
+        st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to Secrets to enable the scanner.")
+    elif not api_key_sc:
+        st.warning("Anthropic API key not found.")
     else:
-        pass  # groww used directly
-        scanner = get_scanner(
-            api_key=api_key,
-            telegram_token=tg_token_sc,
-            telegram_chat_id=tg_chat_sc,
-            groww_token=groww_tok_sc,
+        s = scanner.status()
+        is_run = s["running"]
+        sc_col = "#1A6B3C" if is_run else "#8B1A1A"
+        sc_bg  = "#EBF5F0" if is_run else "#FAECEC"
+        mkt_col = "#1A6B3C" if s["market_open"] else "#8B6914"
+        mkt_lbl = "MARKET OPEN" if s["market_open"] else "MARKET CLOSED"
+        err_html = ('<div style="font-size:11px;color:#8B1A1A;margin-top:4px;">Error: ' + s.get("error","")[:80] + '</div>') if s.get("error") else ""
+        sig_html = ('&nbsp;|&nbsp;Last signal: <b>' + s["last_instrument"] + '</b>') if s.get("last_instrument","—") != "—" else ""
+        st.markdown(
+            '<div style="background:' + sc_bg + ';border:1px solid ' + sc_col + '33;border-left:3px solid ' + sc_col + ';border-radius:2px;padding:14px 18px;margin-bottom:14px;">'
+            '<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:' + sc_col + ';margin-bottom:8px;">'
+            + ('● SCANNER RUNNING' if is_run else '○ SCANNER STOPPED') +
+            '</div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">'
+            '<div><div style="font-size:10px;color:#6B82B0;">SCANS RUN</div>'
+            '<div style="font-family:\'EB Garamond\',serif;font-size:20px;font-weight:600;color:#1B2A4A;">' + str(s["scan_count"]) + '</div></div>'
+            '<div><div style="font-size:10px;color:#6B82B0;">SIGNALS FIRED</div>'
+            '<div style="font-family:\'EB Garamond\',serif;font-size:20px;font-weight:600;color:#1A6B3C;">' + str(s["signals_fired"]) + '</div></div>'
+            '<div><div style="font-size:10px;color:#6B82B0;">LAST SCAN</div>'
+            '<div style="font-size:13px;font-weight:600;color:#1B2A4A;">' + s["last_scan"] + '</div></div>'
+            '</div><div style="margin-top:8px;font-size:12px;color:#6B82B0;">'
+            'Market: <b style="color:' + mkt_col + ';">' + mkt_lbl + '</b>' + sig_html +
+            '</div>' + err_html + '</div>',
+            unsafe_allow_html=True,
         )
 
-        # Status display
-        is_running = scanner.is_running()
-        status_col = "#1A6B3C" if is_running else "#8B1A1A"
-        status_bg  = "#EBF5F0" if is_running else "#FAECEC"
-        status_dot = "●" if is_running else "○"
-
-        st.markdown(f"""
-        <div style="background:{status_bg};border:1px solid {status_col}33;
-        border-left:3px solid {status_col};border-radius:2px;
-        padding:14px 18px;margin-bottom:16px;display:flex;
-        justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
-          <div>
-            <div style="font-size:10px;font-weight:700;letter-spacing:2px;
-            text-transform:uppercase;color:{status_col};margin-bottom:4px;">
-            {status_dot} SCANNER STATUS</div>
-            <div style="font-size:15px;font-weight:600;color:#1B2A4A;">
-            {scanner.status}</div>
-            {'<div style="font-size:12px;color:#6B82B0;margin-top:3px;">Currently scanning: <b>' + scanner.current_symbol + '</b></div>' if scanner.current_symbol else ''}
-          </div>
-          <div style="text-align:right;">
-            <div style="font-size:12px;color:#6B82B0;">Signals sent today: <b style="color:#1B2A4A;">{scanner.signals_sent}</b></div>
-            {'<div style="font-size:12px;color:#6B82B0;">Last scan: <b style="color:#1B2A4A;">' + (scanner.last_scan or "—") + '</b></div>' if scanner.last_scan else ''}
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Scanner settings
-        st.markdown('<div class="sec-label">Scanner Settings</div>', unsafe_allow_html=True)
-        sc1, sc2, sc3 = st.columns(3)
-        with sc1:
-            st.markdown(f'<div class="cs-block"><div class="cs-block-label">Watchlist</div><div style="font-size:13px;color:#1B2A4A;">20 Nifty 50 stocks<br>NIFTY + BANKNIFTY F&O</div></div>', unsafe_allow_html=True)
-        with sc2:
-            st.markdown(f'<div class="cs-block"><div class="cs-block-label">Scan Frequency</div><div style="font-size:13px;color:#1B2A4A;">Every 15 minutes<br>09:15 – 15:25 IST</div></div>', unsafe_allow_html=True)
-        with sc3:
-            st.markdown(f'<div class="cs-block"><div class="cs-block-label">Signal Threshold</div><div style="font-size:13px;color:#1B2A4A;">HIGH conviction only<br>60%+ agent agreement</div></div>', unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # Start / Stop buttons
-        b1, b2, b3 = st.columns([1, 1, 2])
+        b1,b2,b3,b4 = st.columns(4)
         with b1:
-            if not is_running:
-                if st.button("▶ START SCANNER", key="scanner_start", use_container_width=True):
+            if not is_run:
+                if st.button("Start Scanner", key="sc_start", use_container_width=True):
+                    def _ctx():
+                        from groww_data import build_market_context_groww
+                        return build_market_context_groww(groww_tok_sc)
+                    scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc, groww_tok_sc, _ctx)
                     scanner.start()
-                    st.success("✅ Scanner started! You'll receive signals on Telegram.")
+                    st.success("Scanner started! Scans every 15 min during market hours.")
                     st.rerun()
             else:
-                if st.button("⏹ STOP SCANNER", key="scanner_stop", use_container_width=True):
+                if st.button("Stop Scanner", key="sc_stop", use_container_width=True):
                     scanner.stop()
-                    st.warning("Scanner stopped.")
                     st.rerun()
         with b2:
-            if st.button("🔄 Refresh Status", key="scanner_refresh", use_container_width=True):
+            if st.button("Scan Now", key="sc_now", use_container_width=True):
+                if not scanner.running:
+                    def _ctx2():
+                        from groww_data import build_market_context_groww
+                        return build_market_context_groww(groww_tok_sc)
+                    scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc, groww_tok_sc, _ctx2)
+                with st.spinner("Scanning with all 8 agents..."):
+                    result = scanner.force_scan()
+                if result.get("fired"):
+                    st.success("Signal fired: " + str(result.get("direction","")) + " " + str(result.get("instrument","")) + " — check Telegram!")
+                elif result.get("error"):
+                    st.error("Error: " + str(result["error"]))
+                else:
+                    st.info("No signal: " + str(result.get("reason",""))[:80])
+        with b3:
+            if st.button("Refresh", key="sc_refresh", use_container_width=True):
                 st.rerun()
+        with b4:
+            st.markdown('<div style="padding:8px;background:#EEF1F8;border-radius:2px;text-align:center;font-size:10px;font-weight:700;color:#6B82B0;letter-spacing:1px;">SCAN INTERVAL<br><span style="font-size:16px;color:#1B2A4A;">15 min</span></div>', unsafe_allow_html=True)
 
-        # How it works
-        st.markdown('<div class="sec-label">How It Works</div>', unsafe_allow_html=True)
-        st.markdown("""
-        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;">
-          <div class="cs-block" style="border-left:3px solid #1B2A4A;">
-            <div class="cs-block-label">1. Market Opens</div>
-            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Scanner activates at 9:15 AM IST automatically</div>
-          </div>
-          <div class="cs-block" style="border-left:3px solid #8B6914;">
-            <div class="cs-block-label">2. Live Data Fetch</div>
-            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Pulls live prices, OI, VIX, FII flows from Kite/Groww</div>
-          </div>
-          <div class="cs-block" style="border-left:3px solid #1B2A4A;">
-            <div class="cs-block-label">3. Agent Analysis</div>
-            <div style="font-size:12px;color:#2C4070;line-height:1.7;">4 agents scan each stock simultaneously using live data</div>
-          </div>
-          <div class="cs-block" style="border-left:3px solid #8B6914;">
-            <div class="cs-block-label">4. Conviction Filter</div>
-            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Only HIGH conviction + 60% agent agreement passes</div>
-          </div>
-          <div class="cs-block" style="border-left:3px solid #1A6B3C;">
-            <div class="cs-block-label">5. Telegram Alert</div>
-            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Signal sent to your phone with exact entry, SL, targets</div>
-          </div>
-          <div class="cs-block" style="border-left:3px solid #1A6B3C;">
-            <div class="cs-block-label">6. One-Tap Execute</div>
-            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Tap Approve → Groww places OCO order automatically</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown('<div class="disclaimer">AUTONOMOUS SIGNALS ARE FOR EDUCATIONAL PURPOSES ONLY · NOT SEBI-REGISTERED · ALWAYS VERIFY BEFORE EXECUTING · F&O INVOLVES SUBSTANTIAL RISK</div>', unsafe_allow_html=True)
 
-        # Recent scan log
-        if scanner.scan_log:
-            st.markdown('<div class="sec-label">Recent Signals Found</div>', unsafe_allow_html=True)
-            for log in reversed(scanner.scan_log[-10:]):
-                dir_col = "#1A6B3C" if log.get("direction")=="LONG" else "#8B1A1A"
-                st.markdown(
-                    f'<div style="display:flex;justify-content:space-between;padding:8px 14px;'
-                    f'background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {dir_col};'
-                    f'border-radius:2px;margin-bottom:4px;flex-wrap:wrap;gap:8px;">'
-                    f'<span style="font-weight:700;color:#1B2A4A;">{log.get("symbol","")}</span>'
-                    f'<span style="color:{dir_col};font-weight:700;">{log.get("direction","")}</span>'
-                    f'<span style="color:#6B82B0;font-size:11px;">{log.get("agreement","")}% agreement</span>'
-                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#9B9B9B;">{log.get("trade_id","")}</span>'
-                    f'<span style="color:#9B9B9B;font-size:11px;">{log.get("time","")}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-        st.markdown('<div class="disclaimer">AUTONOMOUS SIGNALS ARE FOR EDUCATIONAL PURPOSES ONLY · NOT SEBI-REGISTERED · ALWAYS VERIFY BEFORE EXECUTING · F&O INVOLVES SUBSTANTIAL RISK</div>', unsafe_allow_html=True)
