@@ -16,15 +16,17 @@ from agents import (
     AGENTS, CONSENSUS_CONFIG, TRADE_ADVISOR_CONFIG,
     ANALYTICS_CONFIG, get_agents_for_mode,
 )
-from kite_data import (
-    generate_login_url, generate_access_token, get_kite_client,
-    get_live_indices, get_stock_quote, get_options_chain,
-    get_vix_data, get_fii_dii_data, get_top_movers, build_market_context,
+from groww_data import (
+    get_live_indices_groww, get_stock_quote_groww, get_options_chain_groww,
+    get_vix_data_groww, get_fii_dii_data, get_top_movers_nse,
+    build_market_context_groww,
 )
 from telegram_bot import (
     test_telegram_connection, notify_and_await_approval,
 )
 from trade_log import log_signal, update_status, get_summary, get_all
+from scanner import get_scanner, is_market_open, run_scan_cycle
+from scanner import get_scanner
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -140,8 +142,7 @@ hr{border-color:var(--border)!important;}
 """, unsafe_allow_html=True)
 
 # ── Session defaults ───────────────────────────────────────────────────────────
-for k, v in [("kite_connected", False), ("access_token", None),
-              ("kite_user", None), ("kite_api_key_saved", None)]:
+for k, v in [("groww_token", ""), ("kite_connected", False)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -162,46 +163,73 @@ with st.sidebar:
         st.session_state["api_key"] = api_key_input
 
     st.markdown("---")
-    st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:10px;">Zerodha Kite Connect</div>', unsafe_allow_html=True)
-
-    if st.session_state.kite_connected:
-        st.markdown(f'<div class="kite-badge kb-on">● LIVE — {st.session_state.kite_user or "Zerodha"}</div>', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:10px;color:#6B82B0;margin-top:6px;line-height:1.8;">Real-time data is active.<br>Agents will receive live market context.</div>', unsafe_allow_html=True)
-        if st.button("Disconnect", key="kite_disc"):
-            for k in ["kite_connected","access_token","kite_user","kite_api_key_saved"]:
-                st.session_state[k] = False if k == "kite_connected" else None
-            st.rerun()
+    st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:10px;">Groww Live Data</div>', unsafe_allow_html=True)
+    stored_token = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+    if stored_token:
+        st.markdown('<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:8px 12px;font-size:11px;color:#1A6B3C;font-weight:700;margin-bottom:6px;">● GROWW CONNECTED</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:10px;color:#6B82B0;line-height:1.8;">Live prices, options chain, VIX, OI and FII/DII flows active. Options chain via NSE free feed.</div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div class="kite-badge kb-off">○ Not Connected</div>', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:10px;color:#9B9B9B;margin:8px 0 12px;line-height:1.7;">Connect to receive live prices, options chain, VIX, OI and FII/DII flows.</div>', unsafe_allow_html=True)
+        groww_token_input = st.text_input("Groww API Token", type="password", placeholder="Your Groww access token", key="groww_tok_input")
+        if groww_token_input:
+            st.session_state["groww_token"] = groww_token_input
+            st.success("✅ Token saved for this session.")
+        st.markdown('<div style="font-size:10px;color:#9B9B9B;line-height:1.8;margin-top:6px;">Get at <span style="color:#8B6914;">groww.in/trade-api</span> · ₹499/month<br>Or add GROWW_API_TOKEN to Streamlit Secrets.</div>', unsafe_allow_html=True)
 
-        kite_key    = st.text_input("Kite API Key",    type="password", placeholder="Your Kite API key",    key="kite_key_in")
-        kite_secret = st.text_input("Kite API Secret", type="password", placeholder="Your Kite API secret", key="kite_sec_in")
+    st.markdown("---")
 
-        if kite_key and kite_secret:
-            st.session_state["kite_api_key_saved"]    = kite_key
-            st.session_state["kite_api_secret_saved"] = kite_secret
-            try:
-                login_url = generate_login_url(kite_key)
-                st.markdown(f'<a href="{login_url}" target="_blank" style="display:block;text-align:center;padding:8px;background:#1B2A4A;color:#fff;border-radius:2px;font-size:11px;font-weight:700;letter-spacing:2px;text-decoration:none;margin-bottom:10px;">STEP 1 — LOGIN TO ZERODHA ↗</a>', unsafe_allow_html=True)
-            except Exception:
-                pass
-            st.markdown('<div style="font-size:10px;color:#9B9B9B;margin-bottom:4px;">Step 2 — Paste <code>request_token</code> from redirect URL:</div>', unsafe_allow_html=True)
-            req_token = st.text_input("Request Token", placeholder="Paste here after login", key="kite_req")
-            if req_token and st.button("Connect Now", key="kite_connect_btn"):
-                with st.spinner("Connecting…"):
-                    result = generate_access_token(kite_key, kite_secret, req_token.strip())
-                if result["success"]:
-                    st.session_state.kite_connected       = True
-                    st.session_state.access_token         = result["access_token"]
-                    st.session_state.kite_user            = result.get("user_name","")
-                    st.session_state.kite_api_key_saved   = kite_key
-                    st.success(f"Connected as {result.get('user_name','')}")
-                    st.rerun()
+    # ── Autonomous Scanner ──────────────────────────────────────────────────
+    st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:10px;">🤖 Autonomous Scanner</div>', unsafe_allow_html=True)
+
+    scanner = get_scanner()
+
+    tg_tok_sc  = st.secrets.get("TELEGRAM_BOT_TOKEN","")
+    tg_cid_sc  = st.secrets.get("TELEGRAM_CHAT_ID","")
+    gww_tok_sc = st.secrets.get("GROWW_API_TOKEN","")
+    api_key_sc = st.secrets.get("ANTHROPIC_API_KEY","") or st.session_state.get("api_key","")
+
+    market_open_now = is_market_open()
+
+    if not scanner.running:
+        st.markdown(f'<div style="font-size:11px;color:#9B9B9B;margin-bottom:8px;">{"🟡 Market open — ready to scan" if market_open_now else "🔴 Market closed"}</div>', unsafe_allow_html=True)
+        if tg_tok_sc and tg_cid_sc and api_key_sc:
+            if st.button("▶ Start Auto-Scanner", key="scanner_start", use_container_width=True):
+                def get_live_ctx():
+                    from groww_data import build_market_context_groww
+                    return build_market_context_groww(gww_tok_sc)
+                scanner.configure(api_key_sc, tg_tok_sc, tg_cid_sc, gww_tok_sc, get_live_ctx)
+                scanner.start()
+                st.success("✅ Scanner started! Scans every 15 min during market hours.")
+                st.rerun()
+        else:
+            st.markdown('<div style="font-size:10px;color:#8B1A1A;">Configure API keys in Secrets first.</div>', unsafe_allow_html=True)
+    else:
+        s = scanner.status()
+        mkt_col = "#1A6B3C" if s["market_open"] else "#8B6914"
+        st.markdown(
+            f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:10px;margin-bottom:8px;">'
+            f'<div style="font-size:10px;font-weight:700;color:#1A6B3C;margin-bottom:4px;">● SCANNER ACTIVE</div>'
+            f'<div style="font-size:11px;color:#2C4070;line-height:1.8;">'
+            f'Scans: {s["scan_count"]}  |  Signals: {s["signals_fired"]}<br>'
+            f'Last scan: {s["last_scan"]}<br>'
+            f'Last signal: {s["last_instrument"]}<br>'
+            f'<span style="color:{mkt_col};">{"🟢 Market OPEN" if s["market_open"] else "🟡 Market CLOSED"}</span>'
+            f'{"<br><span style=color:#8B1A1A;>Error: " + s["error"][:40] + "</span>" if s.get("error") else ""}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("⏹ Stop", key="scanner_stop", use_container_width=True):
+                scanner.stop()
+                st.rerun()
+        with col_b:
+            if st.button("🔍 Scan Now", key="scanner_force", use_container_width=True):
+                with st.spinner("Scanning…"):
+                    r = scanner.force_scan()
+                if r.get("fired"):
+                    st.success(f"Signal fired: {r.get('instrument','?')} {r.get('direction','?')}")
                 else:
-                    st.error(result.get("error","Connection failed"))
-
-        st.markdown('<div style="font-size:10px;color:#B8C2D8;line-height:1.8;margin-top:6px;">Get Kite Connect API at<br><span style="color:#8B6914;">kite.trade/connect</span><br>₹2,000/month · Tick-level data</div>', unsafe_allow_html=True)
+                    st.info(f"No signal: {r.get('reason','')[:60]}")
 
     st.markdown("---")
     st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:8px;">Market Reference</div>', unsafe_allow_html=True)
@@ -234,27 +262,10 @@ if not api_key:
     st.stop()
 
 # ── Live data helpers ──────────────────────────────────────────────────────────
-def get_kite():
-    if st.session_state.kite_connected and st.session_state.access_token:
-        return get_kite_client(st.session_state.kite_api_key_saved, st.session_state.access_token)
-    return None
-
-
-def fetch_live_data(kite, underlying="NIFTY", symbol=None, exchange="NSE"):
-    """Fetch all real-time data in parallel."""
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-        f_idx  = ex.submit(get_live_indices, kite)
-        f_vix  = ex.submit(get_vix_data, kite)
-        f_opt  = ex.submit(get_options_chain, kite, underlying)
-        f_fii  = ex.submit(get_fii_dii_data)
-        f_stk  = ex.submit(get_stock_quote, kite, symbol, exchange) if symbol else None
-        results["indices"] = f_idx.result()
-        results["vix"]     = f_vix.result()
-        results["options"] = f_opt.result()
-        results["fii"]     = f_fii.result()
-        results["stock"]   = f_stk.result() if f_stk else None
-    return results
+def get_groww_token():
+    """Return Groww API token from secrets or session state."""
+    return (st.secrets.get("GROWW_API_TOKEN","") or
+            st.session_state.get("groww_token",""))
 
 
 def render_live_ticker(indices: dict, vix: dict):
@@ -617,7 +628,7 @@ def render_cs(data, raw):
 
 
 # ── TABS ───────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["▪  Hive Mind Analysis","▪  Daily Trade Desk","▪  Market Analytics"])
+tab1, tab2, tab3, tab4 = st.tabs(["▪  Hive Mind Analysis","▪  Daily Trade Desk","▪  Market Analytics","▪  Auto Scanner"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — HIVE MIND ANALYSIS
@@ -639,32 +650,37 @@ with tab1:
         launch = st.button("Launch Agents",key="launch_main",use_container_width=True)
 
     if launch and query.strip():
-        kite = get_kite()
+        groww_tok = get_groww_token()
         market_ctx = ""
         live_data  = {}
 
-        # Fetch live data if Kite connected
-        if kite:
-            with st.spinner("Fetching live market data from Zerodha…"):
-                # Detect if query mentions a stock symbol
-                words = query.upper().split()
-                common_stocks = {"RELIANCE","HDFCBANK","INFY","TCS","ICICIBANK","SBIN",
-                                 "BAJFINANCE","KOTAKBANK","LT","AXISBANK","WIPRO","MARUTI"}
-                stock_hit = next((w for w in words if w in common_stocks), None)
-                ul = "BANKNIFTY" if "BANKNIFTY" in query.upper() else "NIFTY"
-                live_data = fetch_live_data(kite, underlying=ul,
-                                            symbol=stock_hit, exchange="NSE")
-                market_ctx = build_market_context(
-                    live_data.get("indices",{}),
-                    live_data.get("vix",{}),
-                    live_data.get("options",{}),
-                    live_data.get("fii",{}),
-                    live_data.get("stock"),
-                )
-
-            # Show live ticker
+        # Fetch live data using Groww API
+        if groww_tok:
+            with st.spinner("Fetching live market data from Groww…"):
+                market_ctx = build_market_context_groww(groww_tok)
+                # Also fetch individual components for ticker display
+                import concurrent.futures as cfe
+                with cfe.ThreadPoolExecutor(max_workers=3) as ex2:
+                    fi2 = ex2.submit(get_live_indices_groww, groww_tok)
+                    fv2 = ex2.submit(get_vix_data_groww, groww_tok)
+                    live_data = {
+                        "indices": fi2.result(),
+                        "vix":     fv2.result(),
+                    }
             if live_data.get("indices",{}).get("success"):
                 render_live_ticker(live_data["indices"], live_data.get("vix",{}))
+        else:
+            # No broker connected — use free NSE data
+            with st.spinner("Fetching market data from NSE (free feed)…"):
+                from groww_data import get_fii_dii_data as _fii, get_options_chain_groww as _oc
+                import concurrent.futures as cfe
+                with cfe.ThreadPoolExecutor(max_workers=3) as ex2:
+                    fi2  = ex2.submit(get_live_indices_groww, "")
+                    fv2  = ex2.submit(get_vix_data_groww, "")
+                    ffi2 = ex2.submit(get_fii_dii_data)
+                    live_data = {"indices": fi2.result(), "vix": fv2.result(), "fii": ffi2.result()}
+                from groww_data import build_market_context_groww as _bmc
+                market_ctx = _bmc("")
 
         agents_to_run = get_agents_for_mode(mode)
         client_ai = anthropic.Anthropic(api_key=api_key)
@@ -826,8 +842,8 @@ with tab1:
     elif launch:
         st.warning("Please enter an investment query.")
     else:
-        kite_status = "● LIVE DATA ACTIVE" if st.session_state.kite_connected else "○ Connect Kite for live data"
-        kite_col    = "#1A6B3C" if st.session_state.kite_connected else "#9B9B9B"
+        kite_status = "● LIVE DATA ACTIVE" if get_groww_token() else "○ Add GROWW_API_TOKEN to Secrets for live data"
+        kite_col    = "#1A6B3C" if get_groww_token() else "#9B9B9B"
         st.markdown(f"""<div class="hero">
           <div class="hero-title">8 Agents Standing By</div>
           <div style="font-size:11px;color:{kite_col};letter-spacing:2px;margin-bottom:12px;">{kite_status}</div>
@@ -860,10 +876,10 @@ with tab2:
     if trade_go and trade_q.strip():
         client_ai = anthropic.Anthropic(api_key=api_key)
         now = datetime.now(IST).strftime("%d %b %Y %H:%M IST")
-        kite = get_kite()
+        groww_tok_loc = get_groww_token()
         live_ctx = ""
 
-        if kite:
+        if True:  # groww data always available
             with st.spinner("Fetching live quote…"):
                 sym = trade_q.strip().upper().replace(" ","")
                 sq  = get_stock_quote(kite, sym)
@@ -957,17 +973,24 @@ Respond ONLY as a JSON array (no markdown):
 with tab3:
     st.markdown('<div style="font-size:13px;color:#6B82B0;margin-bottom:16px;">Live analytics: market breadth, OI, VIX, sector rotation, FII/DII flows, options chain.</div>',unsafe_allow_html=True)
 
-    kite = get_kite()
+    groww_tok3 = get_groww_token()
 
-    # If Kite connected — show live analytics dashboard first
-    if kite:
+    # Show live analytics dashboard
+    if True:  # Always show, uses Groww or free NSE data
         st.markdown('<div class="sec-label">Live Market Dashboard</div>',unsafe_allow_html=True)
         if st.button("🔄 Refresh Live Data", key="refresh_analytics"):
             st.session_state.pop("live_analytics_cache",None)
 
         if "live_analytics_cache" not in st.session_state:
-            with st.spinner("Fetching live data from Zerodha…"):
-                ld = fetch_live_data(kite, underlying="NIFTY")
+            with st.spinner("Fetching live data…"):
+                import concurrent.futures as _cfe
+                from groww_data import get_live_indices_groww as _gi, get_vix_data_groww as _gv, get_options_chain_groww as _go
+                with _cfe.ThreadPoolExecutor(max_workers=4) as _ex:
+                    _fi = _ex.submit(_gi, groww_tok3)
+                    _fv = _ex.submit(_gv, groww_tok3)
+                    _fo = _ex.submit(_go, groww_tok3, "NIFTY")
+                    _ff = _ex.submit(get_fii_dii_data)
+                    ld = {"indices":_fi.result(),"vix":_fv.result(),"options":_fo.result(),"fii":_ff.result()}
                 st.session_state["live_analytics_cache"] = ld
         ld = st.session_state["live_analytics_cache"]
 
@@ -1021,7 +1044,7 @@ with tab3:
 
         # Top movers
         with st.spinner("Fetching top movers…"):
-            movers = get_top_movers(kite)
+            movers = get_top_movers_nse()
         if movers.get("success"):
             st.markdown('<div class="sec-label">Top Movers — Nifty 50</div>',unsafe_allow_html=True)
             m1,m2 = st.columns(2)
@@ -1188,3 +1211,131 @@ if all_trades:
 else:
     st.markdown('<div style="text-align:center;padding:24px;color:#B8C2D8;font-size:12px;letter-spacing:2px;">No trades logged yet. Run an analysis to generate your first signal.</div>',
                 unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — AUTO SCANNER
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown('<div style="font-size:13px;color:#6B82B0;margin-bottom:16px;">Autonomous market scanner — watches all Nifty 50 stocks and F&O during market hours. Sends high-conviction signals to your phone automatically. No query needed.</div>', unsafe_allow_html=True)
+
+    tg_token_sc  = st.secrets.get("TELEGRAM_BOT_TOKEN","")
+    tg_chat_sc   = st.secrets.get("TELEGRAM_CHAT_ID","")
+    groww_tok_sc = st.secrets.get("GROWW_API_TOKEN","")
+
+    if not tg_token_sc or not tg_chat_sc:
+        st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to Streamlit Secrets to enable the scanner.")
+    else:
+        kite_sc = get_kite()
+        scanner = get_scanner(
+            api_key=api_key,
+            telegram_token=tg_token_sc,
+            telegram_chat_id=tg_chat_sc,
+            kite=kite_sc,
+            groww_token=groww_tok_sc,
+        )
+
+        # Status display
+        is_running = scanner.is_running()
+        status_col = "#1A6B3C" if is_running else "#8B1A1A"
+        status_bg  = "#EBF5F0" if is_running else "#FAECEC"
+        status_dot = "●" if is_running else "○"
+
+        st.markdown(f"""
+        <div style="background:{status_bg};border:1px solid {status_col}33;
+        border-left:3px solid {status_col};border-radius:2px;
+        padding:14px 18px;margin-bottom:16px;display:flex;
+        justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div>
+            <div style="font-size:10px;font-weight:700;letter-spacing:2px;
+            text-transform:uppercase;color:{status_col};margin-bottom:4px;">
+            {status_dot} SCANNER STATUS</div>
+            <div style="font-size:15px;font-weight:600;color:#1B2A4A;">
+            {scanner.status}</div>
+            {'<div style="font-size:12px;color:#6B82B0;margin-top:3px;">Currently scanning: <b>' + scanner.current_symbol + '</b></div>' if scanner.current_symbol else ''}
+          </div>
+          <div style="text-align:right;">
+            <div style="font-size:12px;color:#6B82B0;">Signals sent today: <b style="color:#1B2A4A;">{scanner.signals_sent}</b></div>
+            {'<div style="font-size:12px;color:#6B82B0;">Last scan: <b style="color:#1B2A4A;">' + (scanner.last_scan or "—") + '</b></div>' if scanner.last_scan else ''}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Scanner settings
+        st.markdown('<div class="sec-label">Scanner Settings</div>', unsafe_allow_html=True)
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            st.markdown(f'<div class="cs-block"><div class="cs-block-label">Watchlist</div><div style="font-size:13px;color:#1B2A4A;">20 Nifty 50 stocks<br>NIFTY + BANKNIFTY F&O</div></div>', unsafe_allow_html=True)
+        with sc2:
+            st.markdown(f'<div class="cs-block"><div class="cs-block-label">Scan Frequency</div><div style="font-size:13px;color:#1B2A4A;">Every 15 minutes<br>09:15 – 15:25 IST</div></div>', unsafe_allow_html=True)
+        with sc3:
+            st.markdown(f'<div class="cs-block"><div class="cs-block-label">Signal Threshold</div><div style="font-size:13px;color:#1B2A4A;">HIGH conviction only<br>60%+ agent agreement</div></div>', unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Start / Stop buttons
+        b1, b2, b3 = st.columns([1, 1, 2])
+        with b1:
+            if not is_running:
+                if st.button("▶ START SCANNER", key="scanner_start", use_container_width=True):
+                    scanner.start()
+                    st.success("✅ Scanner started! You'll receive signals on Telegram.")
+                    st.rerun()
+            else:
+                if st.button("⏹ STOP SCANNER", key="scanner_stop", use_container_width=True):
+                    scanner.stop()
+                    st.warning("Scanner stopped.")
+                    st.rerun()
+        with b2:
+            if st.button("🔄 Refresh Status", key="scanner_refresh", use_container_width=True):
+                st.rerun()
+
+        # How it works
+        st.markdown('<div class="sec-label">How It Works</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;">
+          <div class="cs-block" style="border-left:3px solid #1B2A4A;">
+            <div class="cs-block-label">1. Market Opens</div>
+            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Scanner activates at 9:15 AM IST automatically</div>
+          </div>
+          <div class="cs-block" style="border-left:3px solid #8B6914;">
+            <div class="cs-block-label">2. Live Data Fetch</div>
+            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Pulls live prices, OI, VIX, FII flows from Kite/Groww</div>
+          </div>
+          <div class="cs-block" style="border-left:3px solid #1B2A4A;">
+            <div class="cs-block-label">3. Agent Analysis</div>
+            <div style="font-size:12px;color:#2C4070;line-height:1.7;">4 agents scan each stock simultaneously using live data</div>
+          </div>
+          <div class="cs-block" style="border-left:3px solid #8B6914;">
+            <div class="cs-block-label">4. Conviction Filter</div>
+            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Only HIGH conviction + 60% agent agreement passes</div>
+          </div>
+          <div class="cs-block" style="border-left:3px solid #1A6B3C;">
+            <div class="cs-block-label">5. Telegram Alert</div>
+            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Signal sent to your phone with exact entry, SL, targets</div>
+          </div>
+          <div class="cs-block" style="border-left:3px solid #1A6B3C;">
+            <div class="cs-block-label">6. One-Tap Execute</div>
+            <div style="font-size:12px;color:#2C4070;line-height:1.7;">Tap Approve → Groww places OCO order automatically</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Recent scan log
+        if scanner.scan_log:
+            st.markdown('<div class="sec-label">Recent Signals Found</div>', unsafe_allow_html=True)
+            for log in reversed(scanner.scan_log[-10:]):
+                dir_col = "#1A6B3C" if log.get("direction")=="LONG" else "#8B1A1A"
+                st.markdown(
+                    f'<div style="display:flex;justify-content:space-between;padding:8px 14px;'
+                    f'background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {dir_col};'
+                    f'border-radius:2px;margin-bottom:4px;flex-wrap:wrap;gap:8px;">'
+                    f'<span style="font-weight:700;color:#1B2A4A;">{log.get("symbol","")}</span>'
+                    f'<span style="color:{dir_col};font-weight:700;">{log.get("direction","")}</span>'
+                    f'<span style="color:#6B82B0;font-size:11px;">{log.get("agreement","")}% agreement</span>'
+                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#9B9B9B;">{log.get("trade_id","")}</span>'
+                    f'<span style="color:#9B9B9B;font-size:11px;">{log.get("time","")}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+        st.markdown('<div class="disclaimer">AUTONOMOUS SIGNALS ARE FOR EDUCATIONAL PURPOSES ONLY · NOT SEBI-REGISTERED · ALWAYS VERIFY BEFORE EXECUTING · F&O INVOLVES SUBSTANTIAL RISK</div>', unsafe_allow_html=True)
