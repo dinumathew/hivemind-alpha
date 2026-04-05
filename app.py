@@ -26,6 +26,7 @@ from telegram_bot import (
 )
 from trade_log import log_signal, update_status, get_summary, get_all
 from scanner import get_scanner, is_market_open, run_scan_cycle
+from order_monitor import get_order_monitor
 from scanner import get_scanner
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -230,6 +231,47 @@ with st.sidebar:
                     st.success(f"Signal fired: {r.get('instrument','?')} {r.get('direction','?')}")
                 else:
                     st.info(f"No signal: {r.get('reason','')[:60]}")
+
+    st.markdown("---")
+
+    # ── Order Monitor ──────────────────────────────────────────────────────
+    st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:10px;">📡 Order Monitor</div>', unsafe_allow_html=True)
+
+    monitor = get_order_monitor()
+    mon_tok  = st.secrets.get("TELEGRAM_BOT_TOKEN","")
+    mon_chat = st.secrets.get("TELEGRAM_CHAT_ID","")
+    mon_gww  = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+
+    if mon_tok and mon_chat and mon_gww:
+        ms = monitor.status()
+        if not monitor.running:
+            if st.button("▶ Start Monitor", key="mon_start", use_container_width=True):
+                monitor.configure(mon_gww, mon_tok, mon_chat)
+                monitor.start()
+                st.success("✅ Order monitor started!")
+                st.rerun()
+            st.markdown('<div style="font-size:10px;color:#9B9B9B;line-height:1.8;">Checks Groww every 5 min.<br>Alerts you on SL/Target hit.<br>Sends EOD P&L summary.</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:10px;margin-bottom:8px;">'
+                f'<div style="font-size:10px;font-weight:700;color:#1A6B3C;margin-bottom:4px;">● MONITOR ACTIVE</div>'
+                f'<div style="font-size:11px;color:#2C4070;line-height:1.9;">'
+                f'Checks: {ms["checks_done"]}  |  Alerts: {ms["alerts_sent"]}<br>'
+                f'Last check: {ms["last_check"]}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                if st.button("⏹ Stop", key="mon_stop", use_container_width=True):
+                    monitor.stop()
+                    st.rerun()
+            with mc2:
+                if st.button("🔍 Check Now", key="mon_check", use_container_width=True):
+                    monitor.force_check()
+                    st.success("Checked!")
+    else:
+        st.markdown('<div style="font-size:10px;color:#9B9B9B;">Configure Groww + Telegram in Secrets first.</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:8px;">Market Reference</div>', unsafe_allow_html=True)
