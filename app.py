@@ -27,6 +27,13 @@ from telegram_bot import (
 from trade_log import log_signal, update_status, get_summary, get_all
 from scanner import get_scanner, is_market_open, run_scan_cycle
 from order_monitor import get_order_monitor
+from live_data import (
+    build_enriched_stock_context, calculate_position_size,
+    size_from_consensus, get_historical_ohlcv_nse,
+    compute_technicals, get_stock_fundamentals,
+    get_latest_earnings, get_market_news_today,
+    parse_price_from_str,
+)
 from scanner import get_scanner
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -35,6 +42,88 @@ st.set_page_config(
     page_title="HIVE MIND ALPHA · SENSEX Intelligence",
     page_icon="▪", layout="wide", initial_sidebar_state="expanded",
 )
+
+# ── Authentication Gate ────────────────────────────────────────────────────────
+def check_password() -> bool:
+    """Returns True if user has entered the correct password."""
+
+    # Already authenticated this session
+    if st.session_state.get("authenticated"):
+        return True
+
+    # Get credentials from Streamlit Secrets
+    app_password = st.secrets.get("APP_PASSWORD", "")
+    app_username = st.secrets.get("APP_USERNAME", "dinu")
+
+    if not app_password:
+        # No password set — allow access (dev mode)
+        st.session_state["authenticated"] = True
+        return True
+
+    # Show login screen
+    st.markdown("""
+    <style>
+    .login-wrap {
+        max-width: 420px; margin: 80px auto;
+        background: #FFFFFF;
+        border: 1px solid #DCE1EC;
+        border-top: 3px solid #1B2A4A;
+        border-radius: 4px;
+        padding: 40px 36px;
+        box-shadow: 0 4px 24px rgba(27,42,74,0.08);
+    }
+    .login-logo {
+        font-family: 'EB Garamond', serif;
+        font-size: 26px; font-weight: 600;
+        color: #1B2A4A; letter-spacing: 4px;
+        text-align: center; margin-bottom: 4px;
+    }
+    .login-logo span { color: #8B6914; }
+    .login-sub {
+        font-size: 10px; font-weight: 500;
+        color: #9B9B9B; letter-spacing: 3px;
+        text-transform: uppercase;
+        text-align: center; margin-bottom: 32px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col_l, col_m, col_r = st.columns([1, 2, 1])
+    with col_m:
+        st.markdown("""
+        <div class="login-wrap">
+          <div class="login-logo">HIVE MIND <span>ALPHA</span></div>
+          <div class="login-sub">SENSEX Intelligence System</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        username = st.text_input(
+            "Username",
+            placeholder="Enter username",
+            key="login_username",
+        )
+        password = st.text_input(
+            "Password",
+            type="password",
+            placeholder="Enter password",
+            key="login_password",
+        )
+        login_btn = st.button("Sign In", use_container_width=True, key="login_btn")
+
+        if login_btn:
+            if username == app_username and password == app_password:
+                st.session_state["authenticated"] = True
+                st.session_state["auth_user"] = username
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+
+    return False
+
+
+# Block entire app if not authenticated
+if not check_password():
+    st.stop()
 
 # ── CSS: White + Navy ─────────────────────────────────────────────────────────
 st.markdown("""
@@ -298,6 +387,14 @@ with st.sidebar:
     st.markdown("---")
     st.markdown('<div style="font-size:9px;letter-spacing:1px;color:#B8C2D8;line-height:1.8;">EDUCATIONAL USE ONLY · NOT SEBI-REGISTERED · F&O INVOLVES RISK</div>', unsafe_allow_html=True)
 
+    st.markdown("---")
+    auth_user = st.session_state.get("auth_user", "dinu")
+    st.markdown(f'<div style="font-size:11px;color:#6B82B0;margin-bottom:8px;">Signed in as <b style="color:#1B2A4A;">{auth_user}</b></div>', unsafe_allow_html=True)
+    if st.button("Sign Out", key="logout_btn", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state["auth_user"] = ""
+        st.rerun()
+
 # ── API Key guard ──────────────────────────────────────────────────────────────
 if not api_key:
     st.markdown('<div class="hero"><div class="hero-title">API Key Required</div><div class="hero-body">Enter your Anthropic API key in the sidebar<br><span style="color:#8B6914;">console.anthropic.com</span></div></div>', unsafe_allow_html=True)
@@ -375,21 +472,24 @@ def render_agent_card(agent, status, text, live=False):
 </div>"""
 
 
-def build_query_msg(q, mode, market_ctx=""):
+def build_query_msg(q, mode, market_ctx="", enriched_ctx=""):
     now = datetime.now(IST).strftime("%d %b %Y %H:%M IST")
-    ctx_block = f"\n{market_ctx}\n" if market_ctx else ""
+    ctx_block      = f"\n{market_ctx}\n" if market_ctx else ""
+    enriched_block = f"\n{enriched_ctx}\n" if enriched_ctx else ""
     return f"""INVESTMENT QUERY: "{q}"
 MODE: {mode.upper()} | SENSEX (BSE) / NIFTY (NSE)
 TIMESTAMP: {now}
-{ctx_block}
-Provide your expert analysis using the live market data above as your primary context.
+{ctx_block}{enriched_block}
+Provide your expert analysis using ALL the live data above — market data, fundamentals,
+technicals, earnings, and news. Anchor every claim to specific numbers from the data.
+
 Structure:
-1. KEY SIGNAL / OPPORTUNITY (reference specific live prices/levels above)
-2. CRITICAL RISK FACTOR
-3. SPECIFIC RECOMMENDATION (Bullish / Bearish / Neutral with exact levels)
+1. KEY SIGNAL / OPPORTUNITY (cite specific data points — P/E, RSI, FII flows, earnings)
+2. CRITICAL RISK FACTOR (with specific levels)
+3. SPECIFIC RECOMMENDATION (Bullish/Bearish/Neutral with exact entry/SL/target levels)
 4. ONE CONTRARIAN TAKE
 
-Be specific, quantitative, and anchor every claim to the live data provided. Max 280 words."""
+Be institutional-grade specific. Max 300 words."""
 
 
 def build_consensus_msg(q, mode, analyses):
@@ -711,6 +811,19 @@ with tab1:
                     }
             if live_data.get("indices",{}).get("success"):
                 render_live_ticker(live_data["indices"], live_data.get("vix",{}))
+
+            # Detect stock symbol in query and fetch enriched data
+            enriched_ctx = ""
+            common_stocks = {"RELIANCE","HDFCBANK","INFY","TCS","ICICIBANK","SBIN",
+                             "BAJFINANCE","KOTAKBANK","LT","AXISBANK","WIPRO","MARUTI",
+                             "TITAN","ASIANPAINT","NESTLEIND","ULTRACEMCO","NTPC",
+                             "POWERGRID","HCLTECH","SUNPHARMA","DIVISLAB","CIPLA"}
+            words = query.upper().split()
+            stock_hit = next((w for w in words if w in common_stocks), None)
+            if stock_hit:
+                with st.spinner(f"Fetching live fundamentals + technicals for {stock_hit}…"):
+                    enriched_ctx = build_enriched_stock_context(groww_tok, stock_hit)
+                st.markdown(f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:8px 14px;font-size:11px;font-weight:700;color:#1A6B3C;margin-bottom:10px;">📊 Live fundamentals, earnings & technicals loaded for {stock_hit}</div>', unsafe_allow_html=True)
         else:
             # No broker connected — use free NSE data
             with st.spinner("Fetching market data from NSE (free feed)…"):
@@ -726,7 +839,8 @@ with tab1:
 
         agents_to_run = get_agents_for_mode(mode)
         client_ai = anthropic.Anthropic(api_key=api_key)
-        user_msg  = build_query_msg(query, mode, market_ctx)
+        enriched_ctx = locals().get('enriched_ctx', '')
+        user_msg  = build_query_msg(query, mode, market_ctx, enriched_ctx)
 
         # Phase 1 — Parallel analysis
         st.markdown('<div class="sec-label">Phase 01 — Individual Agent Analysis</div>',unsafe_allow_html=True)
@@ -826,6 +940,20 @@ with tab1:
         except Exception:
             data={"overall_stance":"NEUTRAL","narrative":raw}
 
+        # Auto-size positions using capital settings
+        cap_val  = st.session_state.get("capital", 500000)
+        risk_val = st.session_state.get("risk_pct", 1.5)
+        if cap_val > 0:
+            sizing = size_from_consensus(cap_val, risk_val, data)
+            if sizing.get("equity"):
+                s = sizing["equity"]
+                data["equity_trade"]["quantity"] = s.get("quantity", 1)
+                data["equity_trade"]["position_size"] = f"{s['quantity']} shares (₹{s['order_value']:,.0f} | Max loss ₹{s['max_loss']:,.0f})"
+            if sizing.get("options"):
+                s = sizing["options"]
+                data["options_trade"]["leg_1"] = data["options_trade"].get("leg_1", {})
+                data["options_trade"]["quantity"] = s.get("lots", 1)
+                data["options_trade"]["net_premium"] = f"₹{s.get('total_premium_outlay',0):,.0f} total ({s.get('lots',1)} lot{'s' if s.get('lots',1)>1 else ''})"
         cs_ph.markdown(render_cs(data,raw),unsafe_allow_html=True)
         prog.progress(100,text="✓ Complete")
 
@@ -1334,3 +1462,223 @@ with tab4:
 
     st.markdown('<div class="disclaimer">AUTONOMOUS SIGNALS ARE FOR EDUCATIONAL PURPOSES ONLY · NOT SEBI-REGISTERED · ALWAYS VERIFY BEFORE EXECUTING · F&O INVOLVES SUBSTANTIAL RISK</div>', unsafe_allow_html=True)
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — SETTINGS & POSITION SIZING
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown('<div style="font-size:13px;color:#6B82B0;margin-bottom:20px;">Configure your capital, risk tolerance, and position sizing rules. Every trade recommendation will use these settings to calculate exact quantities.</div>', unsafe_allow_html=True)
+
+    # ── Capital & Risk Settings ───────────────────────────────────────────────
+    st.markdown('<div class="sec-label">Capital & Risk Configuration</div>', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        capital = st.number_input(
+            "Total Trading Capital (₹)",
+            min_value=10000, max_value=100000000,
+            value=int(st.session_state.get("capital", 500000)),
+            step=10000, format="%d",
+            help="Your total capital allocated for trading",
+            key="capital_input",
+        )
+        st.session_state["capital"] = capital
+
+    with c2:
+        risk_pct = st.number_input(
+            "Max Risk Per Trade (%)",
+            min_value=0.5, max_value=5.0,
+            value=float(st.session_state.get("risk_pct", 1.5)),
+            step=0.5, format="%.1f",
+            help="Max % of capital to risk on any single trade",
+            key="risk_pct_input",
+        )
+        st.session_state["risk_pct"] = risk_pct
+
+    with c3:
+        max_trades = st.number_input(
+            "Max Simultaneous Trades",
+            min_value=1, max_value=10,
+            value=int(st.session_state.get("max_trades", 3)),
+            step=1,
+            help="Maximum number of open trades at once",
+            key="max_trades_input",
+        )
+        st.session_state["max_trades"] = max_trades
+
+    # Show capital allocation summary
+    max_risk_per_trade = capital * risk_pct / 100
+    total_deployed     = max_risk_per_trade * max_trades
+    st.markdown(f"""
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:16px;margin-bottom:24px;">
+      <div style="background:#EEF1F8;border:1px solid #C5D0E6;border-top:2px solid #1B2A4A;border-radius:2px;padding:14px;text-align:center;">
+        <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Total Capital</div>
+        <div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#1B2A4A;">₹{capital:,.0f}</div>
+      </div>
+      <div style="background:#EBF5F0;border:1px solid #A8D4BC;border-top:2px solid #1A6B3C;border-radius:2px;padding:14px;text-align:center;">
+        <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Risk / Trade</div>
+        <div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#1A6B3C;">₹{max_risk_per_trade:,.0f}</div>
+      </div>
+      <div style="background:#FBF8F0;border:1px solid #C9A84C44;border-top:2px solid #8B6914;border-radius:2px;padding:14px;text-align:center;">
+        <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Simultaneous</div>
+        <div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#8B6914;">{max_trades} trades</div>
+      </div>
+      <div style="background:#FAECEC;border:1px solid #F0BABA;border-top:2px solid #8B1A1A;border-radius:2px;padding:14px;text-align:center;">
+        <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Total at Risk</div>
+        <div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#8B1A1A;">₹{total_deployed:,.0f}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Live Position Sizing Calculator ──────────────────────────────────────
+    st.markdown('<div class="sec-label">Position Sizing Calculator</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:12px;color:#6B82B0;margin-bottom:14px;">Enter any trade details to instantly calculate exact quantity based on your risk settings above.</div>', unsafe_allow_html=True)
+
+    ps1, ps2, ps3 = st.columns(3)
+    with ps1:
+        ps_instrument = st.text_input("Instrument", placeholder="e.g. HDFCBANK / NIFTY", key="ps_instr")
+        ps_trade_type = st.selectbox("Trade Type", ["Equity (CNC)", "Equity (Intraday)", "Options (Buy)", "Futures"], key="ps_type")
+    with ps2:
+        ps_entry  = st.number_input("Entry Price (₹)", min_value=0.0, value=0.0, step=0.5, key="ps_entry")
+        ps_sl     = st.number_input("Stop Loss (₹)",   min_value=0.0, value=0.0, step=0.5, key="ps_sl")
+    with ps3:
+        ps_target = st.number_input("Target Price (₹)", min_value=0.0, value=0.0, step=0.5, key="ps_target")
+        ps_lot    = st.number_input("Lot Size (F&O only)", min_value=1, value=75, step=1, key="ps_lot")
+
+    if st.button("Calculate Position Size", key="ps_calc", use_container_width=False):
+        if ps_entry > 0 and ps_sl > 0:
+            is_opts = "Options" in ps_trade_type
+            lev = 5.0 if "Intraday" in ps_trade_type else 1.0
+
+            sizing = calculate_position_size(
+                capital=capital,
+                risk_pct=risk_pct,
+                entry_price=ps_entry,
+                stop_loss_price=ps_sl,
+                lot_size=ps_lot if "F&O" in ps_trade_type or is_opts else 1,
+                is_options=is_opts,
+                premium=ps_entry if is_opts else 0,
+                leverage=lev,
+            )
+
+            if sizing.get("success"):
+                rr = round(abs(ps_target - ps_entry) / abs(ps_entry - ps_sl), 2) if ps_target > 0 else "—"
+                qty_label = "Lots" if is_opts else "Shares"
+                qty_val   = sizing.get("lots", sizing.get("quantity", 0))
+
+                st.markdown(f"""
+                <div style="background:#EEF1F8;border:1px solid #C5D0E6;border-top:3px solid #1B2A4A;border-radius:2px;padding:20px;margin-top:12px;">
+                  <div style="font-family:'EB Garamond',serif;font-size:18px;color:#1B2A4A;margin-bottom:16px;">
+                    Position Sizing — {ps_instrument or "Trade"}</div>
+                  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;">
+                    <div style="background:#fff;border:1px solid #DCE1EC;border-radius:2px;padding:12px;text-align:center;">
+                      <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">{qty_label} to Buy</div>
+                      <div style="font-family:'EB Garamond',serif;font-size:28px;font-weight:600;color:#1B2A4A;">{qty_val}</div>
+                    </div>
+                    <div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:12px;text-align:center;">
+                      <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Loss</div>
+                      <div style="font-family:'EB Garamond',serif;font-size:24px;font-weight:600;color:#8B1A1A;">₹{sizing['max_loss']:,.0f}</div>
+                      <div style="font-size:10px;color:#6B82B0;">{sizing['max_loss_pct']:.1f}% of capital</div>
+                    </div>
+                    <div style="background:#FBF8F0;border:1px solid #C9A84C44;border-radius:2px;padding:12px;text-align:center;">
+                      <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Risk:Reward</div>
+                      <div style="font-family:'EB Garamond',serif;font-size:28px;font-weight:600;color:#8B6914;">1:{rr}</div>
+                    </div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                    <div style="background:#fff;border:1px solid #DCE1EC;border-radius:2px;padding:12px;">
+                      <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:6px;">Order Details</div>
+                      <div style="font-size:13px;color:#1B2A4A;line-height:2.0;">
+                        {"Order Value: <b>₹" + f"{sizing.get('order_value',0):,.0f}</b>" if not is_opts else "Premium Outlay: <b>₹" + f"{sizing.get('total_premium_outlay',0):,.0f}</b>"}<br>
+                        Margin Blocked: <b>₹{sizing.get('margin_blocked', sizing.get('margin_estimate',0)):,.0f}</b><br>
+                        Capital Used: <b>{sizing.get('capital_used_pct', sizing.get('capital_at_risk',0)):.1f}%</b>
+                      </div>
+                    </div>
+                    <div style="background:#fff;border:1px solid #DCE1EC;border-radius:2px;padding:12px;">
+                      <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:6px;">If Target Hit</div>
+                      <div style="font-size:13px;color:#1B2A4A;line-height:2.0;">
+                        {"Profit: <b style='color:#1A6B3C;'>₹" + f"{abs(ps_target - ps_entry) * qty_val:,.0f}</b>" if ps_target > 0 else "Enter target price above"}<br>
+                        {"Return: <b style='color:#1A6B3C;'>" + f"{abs(ps_target - ps_entry)/ps_entry*100:.1f}%</b>" if ps_target > 0 else ""}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.error(f"Sizing error: {sizing.get('error','')}")
+        else:
+            st.warning("Enter entry price and stop loss to calculate.")
+
+    # ── Live Fundamentals Lookup ──────────────────────────────────────────────
+    st.markdown('<div class="sec-label">Live Stock Fundamentals</div>', unsafe_allow_html=True)
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        fund_symbol = st.text_input("Stock Symbol", placeholder="e.g. HDFCBANK, RELIANCE, TCS", key="fund_sym")
+    with fc2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        fund_btn = st.button("Fetch Fundamentals", key="fund_btn", use_container_width=True)
+
+    if fund_btn and fund_symbol.strip():
+        with st.spinner(f"Fetching live data for {fund_symbol.upper()}…"):
+            import concurrent.futures as _cfe
+            with _cfe.ThreadPoolExecutor(max_workers=3) as _ex:
+                _ff = _ex.submit(get_stock_fundamentals, fund_symbol.strip())
+                _fe = _ex.submit(get_latest_earnings, fund_symbol.strip())
+                _fh = _ex.submit(get_historical_ohlcv_nse, fund_symbol.strip(), 60)
+            fund_data  = _ff.result()
+            earn_data  = _fe.result()
+            ohlcv_data = _fh.result()
+
+        tech_data = {}
+        if ohlcv_data.get("success") and ohlcv_data.get("candles"):
+            tech_data = compute_technicals(ohlcv_data["candles"])
+
+        if fund_data.get("success"):
+            fc_a, fc_b, fc_c = st.columns(3)
+            def fbox(label, val, color="#1B2A4A"):
+                v = str(val) if val not in (None, "", "None") else "N/A"
+                return (f'<div style="background:#F8F9FC;border:1px solid #DCE1EC;border-radius:2px;'
+                        f'padding:12px;margin-bottom:8px;">'
+                        f'<div style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#6B82B0;margin-bottom:3px;">{label}</div>'
+                        f'<div style="font-size:15px;font-weight:600;color:{color};">{v}</div></div>')
+
+            with fc_a:
+                st.markdown(fbox("P/E Ratio", fund_data.get("pe_ratio")), unsafe_allow_html=True)
+                st.markdown(fbox("P/B Ratio", fund_data.get("pb_ratio")), unsafe_allow_html=True)
+                st.markdown(fbox("EPS", fund_data.get("eps")), unsafe_allow_html=True)
+                st.markdown(fbox("Market Cap", f"₹{fund_data.get('market_cap_cr','N/A')} Cr"), unsafe_allow_html=True)
+            with fc_b:
+                st.markdown(fbox("Promoter Holding", f"{fund_data.get('promoter_holding','N/A')}%"), unsafe_allow_html=True)
+                st.markdown(fbox("FII Holding", f"{fund_data.get('fii_holding','N/A')}%"), unsafe_allow_html=True)
+                st.markdown(fbox("DII Holding", f"{fund_data.get('dii_holding','N/A')}%"), unsafe_allow_html=True)
+                st.markdown(fbox("Sector", fund_data.get("sector")), unsafe_allow_html=True)
+            with fc_c:
+                if tech_data.get("success"):
+                    st.markdown(fbox("Trend", tech_data.get("trend"), "#1A6B3C" if "UP" in str(tech_data.get("trend","")) else "#8B1A1A"), unsafe_allow_html=True)
+                    st.markdown(fbox("RSI (14)", f"{tech_data.get('rsi14','N/A')} — {tech_data.get('rsi_signal','')}", "#8B6914"), unsafe_allow_html=True)
+                    st.markdown(fbox("Support", f"₹{tech_data.get('support_20d','N/A')}"), unsafe_allow_html=True)
+                    st.markdown(fbox("Resistance", f"₹{tech_data.get('resistance_20d','N/A')}"), unsafe_allow_html=True)
+
+        if earn_data.get("success"):
+            st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin:12px 0 8px;">Latest Earnings</div>', unsafe_allow_html=True)
+            eq1, eq2, eq3, eq4 = st.columns(4)
+            def ebox(label, val, color="#1B2A4A"):
+                return (f'<div style="background:#F8F9FC;border:1px solid #DCE1EC;border-radius:2px;padding:10px;text-align:center;">'
+                        f'<div style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#6B82B0;margin-bottom:3px;">{label}</div>'
+                        f'<div style="font-size:14px;font-weight:600;color:{color};">{val if val not in (None,"None") else "N/A"}</div></div>')
+            with eq1: st.markdown(ebox("Revenue", f"₹{earn_data.get('revenue_cr','N/A')} Cr"), unsafe_allow_html=True)
+            with eq2: st.markdown(ebox("PAT", f"₹{earn_data.get('pat_cr','N/A')} Cr"), unsafe_allow_html=True)
+            with eq3:
+                qoq = earn_data.get("qoq_pat_growth")
+                col = "#1A6B3C" if qoq and float(qoq or 0) > 0 else "#8B1A1A"
+                st.markdown(ebox("QoQ PAT Growth", f"{qoq}%" if qoq else "N/A", col), unsafe_allow_html=True)
+            with eq4:
+                yoy = earn_data.get("yoy_pat_growth")
+                col = "#1A6B3C" if yoy and float(yoy or 0) > 0 else "#8B1A1A"
+                st.markdown(ebox("YoY PAT Growth", f"{yoy}%" if yoy else "N/A", col), unsafe_allow_html=True)
+            beat = earn_data.get("beat_miss","N/A")
+            beat_col = "#1A6B3C" if "BEAT" in str(beat) else "#8B1A1A" if "MISS" in str(beat) else "#8B6914"
+            st.markdown(f'<div style="margin-top:8px;padding:8px 14px;background:#EEF1F8;border-radius:2px;font-size:12px;color:{beat_col};font-weight:700;">Earnings Quality: {beat} ({earn_data.get("period","")})</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="disclaimer">FOR EDUCATIONAL PURPOSES ONLY · NOT SEBI-REGISTERED FINANCIAL ADVICE · POSITION SIZES ARE SUGGESTIONS BASED ON YOUR INPUTS · ALWAYS VERIFY BEFORE TRADING</div>', unsafe_allow_html=True)
