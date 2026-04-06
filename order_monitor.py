@@ -390,6 +390,13 @@ class OrderMonitor:
                     )
                     update_pnl(trade_id, pnl, f"₹{avg_fill:,.2f}")
                     update_status(trade_id, "CLOSED_SL", notes=f"SL hit at ₹{avg_fill:,.2f}")
+                    # TIER 1: Record outcome for walk-forward calibration
+                    try:
+                        from agent_tracker import record_trade_outcome
+                        pnl_pct = pnl / max(abs(entry_price * qty), 1) * 100
+                        record_trade_outcome(trade_id, "LOSS", pnl_pct)
+                    except Exception:
+                        pass
                     with self._lock:
                         self.alerts_sent += 1
 
@@ -400,6 +407,13 @@ class OrderMonitor:
                     )
                     update_pnl(trade_id, pnl, f"₹{avg_fill:,.2f}")
                     update_status(trade_id, "CLOSED_TARGET", notes=f"T2 hit at ₹{avg_fill:,.2f}")
+                    # TIER 1: Record outcome for walk-forward calibration
+                    try:
+                        from agent_tracker import record_trade_outcome
+                        pnl_pct = pnl / max(abs(entry_price * qty), 1) * 100
+                        record_trade_outcome(trade_id, "WIN", pnl_pct)
+                    except Exception:
+                        pass
                     with self._lock:
                         self.alerts_sent += 1
 

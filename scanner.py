@@ -244,6 +244,21 @@ def run_scan_cycle(api_key: str, telegram_token: str, telegram_chat_id: str,
                 "agent_results": agent_results,
                 "timestamp": datetime.now(IST).isoformat()}
 
+    # TIER 3: Apply regime-blended weights before meta-scanner
+    try:
+        from regime import get_blended_weights
+        from agent_tracker import apply_weights_to_consensus
+        blended = get_blended_weights()
+        agent_results = apply_weights_to_consensus(agent_results)
+        # Inject weights into meta context
+        weight_ctx = "\nAGENT CALIBRATED WEIGHTS: " + ", ".join(
+            f"{aid}={round(w*100,1)}%" for aid,w in blended.items()
+            if agent_results.get(aid,{}).get("found_opportunity")
+        )
+        market_context = market_context + weight_ctx
+    except Exception:
+        pass
+
     meta = run_meta(agent_results, market_context, api_key)
 
     if not meta.get("fire_signal"):
@@ -291,6 +306,14 @@ def run_scan_cycle(api_key: str, telegram_token: str, telegram_chat_id: str,
     }
 
     log_signal(f"[AUTO] {instrument}", "scanner", consensus)
+
+    # TIER 1: Record agent votes for walk-forward calibration
+    try:
+        from agent_tracker import record_votes_from_scan
+        record_votes_from_scan(trade_id, agent_results, instrument,
+                               meta.get("direction", "LONG"))
+    except Exception:
+        pass
 
     return {"fired": True, "trade_id": trade_id, "instrument": instrument,
             "direction": meta.get("direction"), "conviction": meta.get("overall_conviction"),

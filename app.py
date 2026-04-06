@@ -27,6 +27,15 @@ from telegram_bot import (
 from trade_log import log_signal, update_status, get_summary, get_all
 from scanner import get_scanner, is_market_open, run_scan_cycle
 from order_monitor import get_order_monitor
+from backtest import run_full_backtest_suite, load_backtest_results
+from guard import verify_all_agents, build_guard_summary
+from agent_tracker import (record_votes_from_scan, record_trade_outcome,
+    get_leaderboard, calibrate_weights, should_recalibrate,
+    get_current_weights, get_calibration_history, apply_weights_to_consensus)
+from portfolio_risk import full_pre_trade_check, get_open_positions
+from smart_money import build_smart_money_context, get_bulk_deals, get_block_deals
+from regime import detect_regime, get_blended_weights, save_regime, get_regime_history
+from sentiment import build_sentiment_context, get_market_wide_sentiment
 from live_data import (
     build_enriched_stock_context, calculate_position_size,
     size_from_consensus, get_historical_ohlcv_nse,
@@ -770,7 +779,7 @@ def render_cs(data, raw):
 
 
 # ── TABS ───────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["▪  Hive Mind Analysis","▪  Daily Trade Desk","▪  Market Analytics","▪  Auto Scanner"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["▪  Hive Mind Analysis","▪  Daily Trade Desk","▪  Market Analytics","▪  Auto Scanner","▪  Intelligence Hub","▪  Settings & Sizing"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — HIVE MIND ANALYSIS
@@ -821,9 +830,17 @@ with tab1:
             words = query.upper().split()
             stock_hit = next((w for w in words if w in common_stocks), None)
             if stock_hit:
-                with st.spinner(f"Fetching live fundamentals + technicals for {stock_hit}…"):
-                    enriched_ctx = build_enriched_stock_context(groww_tok, stock_hit)
-                st.markdown(f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:8px 14px;font-size:11px;font-weight:700;color:#1A6B3C;margin-bottom:10px;">📊 Live fundamentals, earnings & technicals loaded for {stock_hit}</div>', unsafe_allow_html=True)
+                with st.spinner(f"Fetching live fundamentals + technicals + Screener data for {stock_hit}…"):
+                    import concurrent.futures as _scfe
+                    with _scfe.ThreadPoolExecutor(max_workers=2) as _sex:
+                        _fe = _sex.submit(build_enriched_stock_context, groww_tok, stock_hit)
+                        try:
+                            from live_data import build_screener_context as _bsc
+                            _fs = _sex.submit(_bsc, stock_hit)
+                            enriched_ctx = _fe.result() + _fs.result()
+                        except Exception:
+                            enriched_ctx = _fe.result()
+                st.markdown(f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:8px 14px;font-size:11px;font-weight:700;color:#1A6B3C;margin-bottom:10px;">📊 Live fundamentals + Screener.in data loaded for {stock_hit}</div>', unsafe_allow_html=True)
         else:
             # No broker connected — use free NSE data
             with st.spinner("Fetching market data from NSE (free feed)…"):
@@ -840,7 +857,43 @@ with tab1:
         agents_to_run = get_agents_for_mode(mode)
         client_ai = anthropic.Anthropic(api_key=api_key)
         enriched_ctx = locals().get('enriched_ctx', '')
-        user_msg  = build_query_msg(query, mode, market_ctx, enriched_ctx)
+
+        # ── TIER 2+3: Smart Money + Sentiment + Regime context ──────────────
+        smart_ctx   = ""
+        sent_ctx    = ""
+        regime_ctx  = ""
+        try:
+            with st.spinner("Fetching smart money, sentiment & regime data…"):
+                import concurrent.futures as _cx
+                with _cx.ThreadPoolExecutor(max_workers=3) as _tex:
+                    _fs = _tex.submit(build_smart_money_context, query)
+                    _fk = _tex.submit(build_sentiment_context, api_key,
+                                      next((w for w in query.upper().split()
+                                            if w in {"RELIANCE","HDFCBANK","INFY","TCS",
+                                                     "ICICIBANK","SBIN","BAJFINANCE",
+                                                     "KOTAKBANK","LT","AXISBANK"}), None))
+                    smart_ctx  = _fs.result()
+                    sent_ctx   = _fk.result()
+        except Exception: pass
+
+        # Regime detection and weight adjustment
+        try:
+            _ld = live_data or {}
+            _regime = detect_regime(
+                _ld.get("indices",{}), _ld.get("vix",{}), _ld.get("fii",{}))
+            if _regime.get("success"):
+                save_regime(_regime)
+                regime_ctx = (f"\nMARKET REGIME: {_regime['regime']} — {_regime['description']}"
+                              f"\nBias: {_regime['bias']} | VIX: {_regime.get('vix_level',0):.1f}"
+                              f"\nRegime favours: {', '.join(_regime.get('favoured_agents',[]))}")
+                # Auto-calibrate weights if due
+                if should_recalibrate():
+                    calibrate_weights(lookback_days=60)
+        except Exception: pass
+
+        # Build enriched message with ALL context layers
+        full_enriched = "\n".join(filter(None, [enriched_ctx, smart_ctx, sent_ctx, regime_ctx]))
+        user_msg  = build_query_msg(query, mode, market_ctx, full_enriched)
 
         # Phase 1 — Parallel analysis
         st.markdown('<div class="sec-label">Phase 01 — Individual Agent Analysis</div>',unsafe_allow_html=True)
@@ -879,6 +932,37 @@ with tab1:
             concurrent.futures.wait(futures)
 
         final = {aid:d["text"] for aid,d in result_store.items() if not d.get("error")}
+
+        # ── TIER 1: Hallucination Guard ─────────────────────────────────────
+        guard_results = {}
+        guard_summary = {}
+        try:
+            prog.progress(42, text="Running hallucination guard…")
+            guard_results = verify_all_agents(final, api_key, groww_tok or "", live_data.get("indices",{}))
+            guard_summary = build_guard_summary(guard_results)
+            total_hall = guard_summary.get("total_hallucinations", 0)
+            confidence = guard_summary.get("overall_confidence", 100)
+            # Replace hallucinated agent outputs with corrected versions
+            for aid, gr in guard_results.items():
+                if gr.get("corrected_text") and gr.get("corrected_text") != final.get(aid,""):
+                    final[aid] = gr["corrected_text"]
+            if total_hall > 0:
+                st.markdown(
+                    f'<div style="background:#FEF3E2;border:1px solid #C9A84C44;border-left:3px solid #8B6914;'
+                    f'border-radius:2px;padding:10px 14px;margin-bottom:10px;font-size:12px;">'
+                    f'🛡 <b>Hallucination Guard:</b> {total_hall} factual claim(s) flagged across agents. '
+                    f'Confidence: {confidence:.0f}%. Corrected values applied where possible.</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-left:3px solid #1A6B3C;'
+                    f'border-radius:2px;padding:8px 14px;margin-bottom:10px;font-size:12px;color:#1A6B3C;">'
+                    f'🛡 Guard: All agent claims verified. Confidence {confidence:.0f}%.</div>',
+                    unsafe_allow_html=True
+                )
+        except Exception as _ge:
+            pass  # Guard failure should never block analysis
 
         # Phase 2 — Debate
         st.markdown('<div class="sec-label">Phase 02 — Cross-Agent Debate</div>',unsafe_allow_html=True)
@@ -969,6 +1053,63 @@ with tab1:
 
         if tg_token and tg_chat and (has_eq or has_op):
             st.markdown('<div class="sec-label">Send to Telegram for Approval</div>',unsafe_allow_html=True)
+
+            # ── TIER 2: Portfolio Risk Check ─────────────────────────────────
+            try:
+                instrument = (data.get("equity_trade",{}).get("instrument","")
+                              or data.get("options_trade",{}).get("underlying",""))
+                direction  = (data.get("equity_trade",{}).get("direction","LONG")
+                              if has_eq else "LONG")
+                cap_v = st.session_state.get("capital", 500000)
+                eq_t  = data.get("equity_trade",{})
+                trade_val = cap_v * st.session_state.get("risk_pct",1.5) / 100
+                risk_check = full_pre_trade_check(
+                    token=groww_tok or "",
+                    instrument=instrument,
+                    direction=direction,
+                    order_value=trade_val,
+                    capital=cap_v,
+                )
+                if not risk_check.get("approved"):
+                    st.markdown(
+                        '<div style="background:#FAECEC;border:1px solid #F0BABA;border-left:3px solid #8B1A1A;'
+                        'border-radius:2px;padding:12px 16px;margin-bottom:10px;">'
+                        '<div style="font-size:11px;font-weight:700;color:#8B1A1A;margin-bottom:6px;">'
+                        '⚠ PORTFOLIO RISK CHECK FAILED</div>'
+                        '<div style="font-size:12px;color:#2C4070;line-height:1.8;">'
+                        + "<br>".join([f"• {b}" for b in risk_check.get("blocks",[])]) +
+                        '</div></div>',
+                        unsafe_allow_html=True
+                    )
+                    st.warning("Trade blocked by portfolio risk rules. Review limits in Settings tab.")
+                else:
+                    warns = risk_check.get("warnings",[])
+                    if warns:
+                        st.markdown(
+                            '<div style="background:#FEF3E2;border:1px solid #C9A84C44;border-left:3px solid #8B6914;'
+                            'border-radius:2px;padding:10px 14px;margin-bottom:10px;font-size:12px;">'
+                            '⚡ Risk warnings: ' + " · ".join(warns) + '</div>',
+                            unsafe_allow_html=True
+                        )
+            except Exception: pass
+
+            # ── TIER 2: Pre-Trade Execution Filter ───────────────────────────
+            try:
+                from portfolio_risk import check_execution_quality
+                exec_check = check_execution_quality(
+                    token=groww_tok or "",
+                    symbol=data.get("equity_trade",{}).get("instrument","") or "",
+                )
+                if not exec_check.get("ok"):
+                    st.markdown(
+                        f'<div style="background:#FEF3E2;border:1px solid #C9A84C44;border-left:3px solid #8B6914;'
+                        f'border-radius:2px;padding:8px 14px;margin-bottom:8px;font-size:12px;color:#8B6914;">'
+                        f'⏰ Execution warning: {exec_check.get("reason","")}. '
+                        f'Consider waiting for better conditions.</div>',
+                        unsafe_allow_html=True
+                    )
+            except Exception: pass
+
             st.markdown(f'<div style="background:#EEF1F8;border:1px solid #C5D0E6;border-left:3px solid #1B2A4A;border-radius:2px;padding:16px 18px;margin-bottom:12px;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:8px;">TRADE ID: <code style="color:#1B2A4A;">{trade_id}</code></div><div style="font-size:13px;color:#2C4070;line-height:1.8;">A Telegram message with <b>Approve ✅</b> and <b>Reject ❌</b> buttons will be sent to your phone.<br>Approving executes on Groww via OCO (entry + SL + target). <span style="color:#8B1A1A;font-weight:600;">You have 5 minutes to respond.</span></div></div>',unsafe_allow_html=True)
             c1,c2,c3 = st.columns([2,1,1])
             with c2:
@@ -1682,3 +1823,331 @@ with tab4:
             st.markdown(f'<div style="margin-top:8px;padding:8px 14px;background:#EEF1F8;border-radius:2px;font-size:12px;color:{beat_col};font-weight:700;">Earnings Quality: {beat} ({earn_data.get("period","")})</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="disclaimer">FOR EDUCATIONAL PURPOSES ONLY · NOT SEBI-REGISTERED FINANCIAL ADVICE · POSITION SIZES ARE SUGGESTIONS BASED ON YOUR INPUTS · ALWAYS VERIFY BEFORE TRADING</div>', unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — INTELLIGENCE HUB (Tier 1, 2, 3 features)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown('<div style="font-size:13px;color:#6B82B0;margin-bottom:16px;">Backtesting · Agent Performance · Guard · Regime · Smart Money · Sentiment</div>', unsafe_allow_html=True)
+
+    ih1, ih2, ih3, ih4, ih5 = st.tabs([
+        "📊 Backtest",
+        "🏆 Agent Leaderboard",
+        "🛡 Guard",
+        "🌐 Regime + Sentiment",
+        "💰 Smart Money",
+    ])
+
+    # ── Backtest ───────────────────────────────────────────────────────────────
+    with ih1:
+        st.markdown('<div class="sec-label">Backtesting Engine — Tier 1</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#6B82B0;margin-bottom:14px;">Tests all 12 technical signal types against 500 days of historical data. Grades each signal A-D by Sharpe ratio, win rate, and expectancy.</div>', unsafe_allow_html=True)
+
+        bt1, bt2, bt3, bt4 = st.columns(4)
+        with bt1: bt_sym = st.text_input("Symbol", placeholder="e.g. HDFCBANK", key="bt_sym")
+        with bt2: bt_days = st.selectbox("History", [250,365,500], format_func=lambda x: f"{x} days", key="bt_days")
+        with bt3: bt_sl   = st.number_input("SL ATR Mult", 0.5, 3.0, 1.5, 0.5, key="bt_sl")
+        with bt4:
+            st.markdown("<br>", unsafe_allow_html=True)
+            bt_go = st.button("Run Backtest", key="bt_go", use_container_width=True)
+
+        if bt_go and bt_sym.strip():
+            gww = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+            with st.spinner(f"Backtesting {bt_sym.upper()} — fetching {bt_days} days of data..."):
+                bt_result = run_full_backtest_suite(gww, bt_sym.strip(), bt_days, bt_sl)
+
+            if bt_result.get("success"):
+                st.markdown(f'<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:10px 14px;font-size:12px;color:#1A6B3C;margin-bottom:12px;"><b>Backtest Complete</b> — {bt_result["candles_used"]} candles ({bt_result["date_range"]}) | {bt_result["signals_with_trades"]} signals generated trades</div>', unsafe_allow_html=True)
+
+                if bt_result.get("grade_A_signals"):
+                    st.markdown(f'<div style="background:#EBF5F0;border-left:3px solid #1A6B3C;border-radius:2px;padding:10px 14px;margin-bottom:10px;"><b style="color:#1A6B3C;">Grade A Signals:</b> {", ".join(bt_result["grade_A_signals"])}</div>', unsafe_allow_html=True)
+
+                for r in bt_result.get("all_results",[])[:8]:
+                    grade_col = {"A":"#1A6B3C","B":"#8B6914","C":"#6B82B0","D":"#8B1A1A"}.get(r.get("grade","D"),"#6B82B0")
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;padding:10px 14px;'
+                        f'background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {grade_col};'
+                        f'border-radius:2px;margin-bottom:6px;flex-wrap:wrap;gap:8px;">'
+                        f'<div><span style="font-weight:700;color:#1B2A4A;">{r["signal"]} ({r["direction"]})</span>'
+                        f'&nbsp;&nbsp;<span style="background:{grade_col};color:#fff;padding:2px 8px;border-radius:1px;font-size:11px;font-weight:700;">GRADE {r.get("grade","?")}</span></div>'
+                        f'<div style="display:flex;gap:16px;font-size:12px;">'
+                        f'<span>Trades: <b>{r["total_trades"]}</b></span>'
+                        f'<span>Win Rate: <b style="color:{grade_col};">{r["win_rate"]}%</b></span>'
+                        f'<span>Sharpe: <b>{r["sharpe_ratio"]}</b></span>'
+                        f'<span>Expectancy: <b>{r["expectancy"]}%</b></span>'
+                        f'<span>Max DD: <b style="color:#8B1A1A;">{r["max_drawdown"]}%</b></span>'
+                        f'</div></div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.error(f"Backtest failed: {bt_result.get('error','')}")
+
+        # Show cached results
+        cached = load_backtest_results()
+        if cached and not (bt_go and bt_sym.strip()):
+            st.markdown('<div class="sec-label">Cached Backtest Results</div>', unsafe_allow_html=True)
+            for sym, data in list(cached.items())[:5]:
+                if data.get("best_signal"):
+                    bs = data["best_signal"]
+                    st.markdown(f'<div style="padding:8px 14px;background:#EEF1F8;border-radius:2px;margin-bottom:6px;font-size:12px;"><b style="color:#1B2A4A;">{sym}</b> — Best: {bs["signal"]} ({bs["direction"]}) | Win Rate: {bs["win_rate"]}% | Sharpe: {bs["sharpe_ratio"]} | A-signals: {", ".join(data.get("grade_A_signals",[]) or ["None"])}</div>', unsafe_allow_html=True)
+
+    # ── Agent Leaderboard ──────────────────────────────────────────────────────
+    with ih2:
+        st.markdown('<div class="sec-label">Agent Leaderboard — Tier 1 + Tier 3</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#6B82B0;margin-bottom:14px;">Live performance tracking of each agent. Walk-forward calibration adjusts consensus weights monthly based on who is actually right.</div>', unsafe_allow_html=True)
+
+        lb_col1, lb_col2 = st.columns(2)
+        with lb_col1:
+            if st.button("🔄 Recalibrate Weights Now", key="recalib_btn", use_container_width=True):
+                new_w = calibrate_weights(lookback_days=60)
+                st.success("Weights recalibrated!")
+        with lb_col2:
+            needs_recalib = should_recalibrate()
+            status_col = "#8B1A1A" if needs_recalib else "#1A6B3C"
+            st.markdown(f'<div style="padding:10px;background:#EEF1F8;border-radius:2px;font-size:12px;color:{status_col};">{"⚠ Recalibration due (30+ days)" if needs_recalib else "✓ Weights up to date"}</div>', unsafe_allow_html=True)
+
+        leaderboard = get_leaderboard()
+        for i, row in enumerate(leaderboard):
+            medal = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣"][i]
+            score_col = "#1A6B3C" if row["score"] >= 60 else "#8B6914" if row["score"] >= 50 else "#8B1A1A"
+            votes = row["total_votes"]
+            wr    = row["win_rate"]
+
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:12px 16px;background:#F8F9FC;border:1px solid #DCE1EC;'
+                f'border-left:3px solid {score_col};border-radius:2px;margin-bottom:6px;flex-wrap:wrap;gap:8px;">'
+                f'<div><span style="font-size:16px;">{medal}</span>&nbsp;&nbsp;'
+                f'<span style="font-weight:700;color:#1B2A4A;">{row["name"]}</span></div>'
+                f'<div style="display:flex;gap:16px;font-size:12px;align-items:center;">'
+                f'<span>Score: <b style="color:{score_col};">{row["score"]:.0f}</b></span>'
+                f'<span>Win Rate: <b>{wr:.0f}%</b></span>'
+                f'<span>Votes: <b>{votes}</b></span>'
+                f'<span style="background:#EEF1F8;padding:2px 8px;border-radius:1px;font-size:11px;font-weight:700;color:#1B2A4A;">Weight: {row["weight"]}%</span>'
+                f'{"<span style=\"color:#9B9B9B;font-size:11px;\">Not enough data</span>" if votes < 5 else ""}'
+                f'</div></div>',
+                unsafe_allow_html=True
+            )
+
+        history = get_calibration_history()
+        if history:
+            with st.expander("Calibration History"):
+                for h in reversed(history[-5:]):
+                    st.markdown(f'<div style="font-size:11px;color:#6B82B0;padding:6px 0;border-bottom:1px solid #DCE1EC;">{h.get("timestamp","")[:16]} — {h.get("reason","Calibrated")} — Agents used: {len(h.get("agents_used",[]))}</div>', unsafe_allow_html=True)
+
+    # ── Guard ──────────────────────────────────────────────────────────────────
+    with ih3:
+        st.markdown('<div class="sec-label">Hallucination Guard — Tier 1</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#6B82B0;margin-bottom:14px;">Verifies all factual claims made by agents (prices, ratios, index levels) against live data before consensus. Flags and corrects fabricated numbers.</div>', unsafe_allow_html=True)
+
+        st.markdown("""
+        <div style="background:#EEF1F8;border:1px solid #C5D0E6;border-left:3px solid #1B2A4A;border-radius:2px;padding:14px 16px;margin-bottom:12px;">
+        <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:8px;">HOW IT WORKS</div>
+        <div style="font-size:12.5px;color:#2C4070;line-height:1.8;">
+        The guard runs automatically on every analysis. After each agent produces their output, Claude extracts all specific factual claims (e.g. "NIFTY is at 24,150" or "HDFCBANK P/E is 18"). Each claim is then verified against live Groww/NSE data.
+        Claims within 5% tolerance pass. Claims >20% off live data are flagged as HIGH severity hallucinations and corrected inline before the consensus receives the analysis. The overall confidence score is shown on every analysis.
+        </div></div>
+        """, unsafe_allow_html=True)
+
+        guard_test_sym = st.text_input("Test Guard on Symbol", placeholder="e.g. HDFCBANK", key="guard_sym")
+        if st.button("Run Guard Test", key="guard_test_btn"):
+            api_k = st.secrets.get("ANTHROPIC_API_KEY","") or st.session_state.get("api_key","")
+            gww_t = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+            test_text = f"{guard_test_sym.upper()} is trading at around 5,000 with P/E of 200 and NIFTY at 50,000."
+            with st.spinner("Running guard..."):
+                from guard import verify_agent_output
+                result = verify_agent_output("test", test_text, api_k, gww_t)
+
+            conf_col = "#1A6B3C" if result["confidence"] > 80 else "#8B6914" if result["confidence"] > 60 else "#8B1A1A"
+            st.markdown(f'<div style="padding:12px 14px;background:#EEF1F8;border-radius:2px;margin-bottom:10px;"><b>Confidence: <span style="color:{conf_col};">{result["confidence"]}%</span></b> | Claims checked: {result["claims_checked"]} | Passed: {result["claims_passed"]}</div>', unsafe_allow_html=True)
+
+            if result["hallucinations"]:
+                for h in result["hallucinations"]:
+                    sev_col = "#8B1A1A" if h["severity"]=="HIGH" else "#8B6914"
+                    st.markdown(f'<div style="background:#FAECEC;border-left:3px solid {sev_col};border-radius:2px;padding:10px 14px;margin-bottom:6px;font-size:12px;"><b style="color:{sev_col};">{h["severity"]} HALLUCINATION</b> — {h["type"]}: claimed {h["claimed"]}, actual {h.get("actual","?")} ({h.get("diff_pct","?")}% off)</div>', unsafe_allow_html=True)
+            else:
+                st.success("No hallucinations detected in test.")
+
+    # ── Regime + Sentiment ─────────────────────────────────────────────────────
+    with ih4:
+        st.markdown('<div class="sec-label">Market Regime + NLP Sentiment — Tier 3</div>', unsafe_allow_html=True)
+
+        rg1, rg2 = st.columns(2)
+        with rg1:
+            if st.button("Detect Regime Now", key="regime_btn", use_container_width=True):
+                gww = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+                with st.spinner("Detecting regime..."):
+                    from groww_data import get_live_indices_groww, get_vix_data_groww, get_fii_dii_data
+                    import concurrent.futures as _cfe
+                    with _cfe.ThreadPoolExecutor(max_workers=3) as _ex:
+                        _fi = _ex.submit(get_live_indices_groww, gww)
+                        _fv = _ex.submit(get_vix_data_groww, gww)
+                        _ff = _ex.submit(get_fii_dii_data)
+                    regime_result = detect_regime(_fi.result(), _fv.result(), _ff.result())
+                    save_regime(regime_result)
+
+                rc = {"BULL_TREND":"#1A6B3C","BEAR_TREND":"#8B1A1A","CRISIS":"#8B1A1A",
+                      "HIGH_VOLATILITY":"#8B6914","LOW_VOLATILITY":"#1A6B3C","SIDEWAYS":"#1B2A4A","RECOVERY":"#8B6914"}.get(regime_result["regime"],"#1B2A4A")
+                st.markdown(f"""
+                <div style="background:#EEF1F8;border:1px solid {rc}44;border-top:3px solid {rc};border-radius:2px;padding:16px;margin-top:10px;">
+                  <div style="font-family:'EB Garamond',serif;font-size:22px;font-weight:600;color:{rc};margin-bottom:6px;">{regime_result["regime"].replace("_"," ")}</div>
+                  <div style="font-size:12px;color:#6B82B0;margin-bottom:10px;">{regime_result["description"]}</div>
+                  <div style="font-size:11px;color:#2C4070;margin-bottom:8px;">Confidence: <b>{regime_result["confidence"]}%</b></div>
+                  <div style="font-size:11px;color:#2C4070;">{"<br>".join(["• " + s for s in regime_result.get("signals",[])])}</div>
+                </div>""", unsafe_allow_html=True)
+
+                st.markdown('<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin:12px 0 8px;">Regime-Adjusted Agent Weights</div>', unsafe_allow_html=True)
+                for aid, w in sorted(regime_result["regime_weights"].items(), key=lambda x: -x[1]):
+                    pct = round(w*100, 1)
+                    bar_w = int(pct * 6)
+                    st.markdown(f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;"><span style="font-size:11px;color:#1B2A4A;min-width:160px;">{aid.replace("_"," ").title()}</span><div style="background:#1B2A4A;height:8px;width:{bar_w}px;border-radius:2px;"></div><span style="font-size:11px;color:#8B6914;font-weight:700;">{pct}%</span></div>', unsafe_allow_html=True)
+
+        with rg2:
+            sent_sym = st.text_input("NLP Sentiment for Symbol", placeholder="e.g. RELIANCE", key="sent_sym")
+            if st.button("Run Sentiment Analysis", key="sent_btn", use_container_width=True):
+                api_k = st.secrets.get("ANTHROPIC_API_KEY","") or st.session_state.get("api_key","")
+                with st.spinner("Analysing sentiment..."):
+                    sent_ctx = build_sentiment_context(api_k, sent_sym.strip() if sent_sym.strip() else None)
+                st.markdown(f'<div style="background:#F8F9FC;border:1px solid #DCE1EC;border-radius:2px;padding:14px;font-size:12px;color:#2C4070;white-space:pre-wrap;line-height:1.8;">{sent_ctx}</div>', unsafe_allow_html=True)
+
+        # Regime history
+        rh = get_regime_history(10)
+        if rh:
+            st.markdown('<div class="sec-label">Recent Regime History</div>', unsafe_allow_html=True)
+            for r in reversed(rh[-5:]):
+                rc2 = {"BULL_TREND":"#1A6B3C","BEAR_TREND":"#8B1A1A","CRISIS":"#8B1A1A"}.get(r.get("regime",""),"#1B2A4A")
+                st.markdown(f'<div style="padding:6px 12px;background:#EEF1F8;border-left:3px solid {rc2};border-radius:2px;margin-bottom:4px;font-size:11px;"><b style="color:{rc2};">{r.get("regime","?")}</b> — {r.get("timestamp","")[:16]} — {r.get("confidence",0):.0f}% confidence</div>', unsafe_allow_html=True)
+
+    # ── Smart Money ────────────────────────────────────────────────────────────
+    with ih5:
+        st.markdown('<div class="sec-label">Smart Money Tracker — Tier 2</div>', unsafe_allow_html=True)
+
+        sm1, sm2 = st.columns([2,1])
+        with sm1:
+            sm_sym = st.text_input("Symbol (optional — leave blank for all)", placeholder="e.g. HDFCBANK", key="sm_sym")
+        with sm2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            sm_go = st.button("Fetch Smart Money", key="sm_go", use_container_width=True)
+
+        if sm_go:
+            sym_filter = sm_sym.strip().upper() if sm_sym.strip() else None
+            with st.spinner("Fetching bulk/block deals and unusual options..."):
+                import concurrent.futures as _cfe
+                from smart_money import get_unusual_options_activity
+                with _cfe.ThreadPoolExecutor(max_workers=3) as _ex:
+                    _fb = _ex.submit(get_bulk_deals, 5, sym_filter)
+                    _fbl= _ex.submit(get_block_deals, 5, sym_filter)
+                    _fo = _ex.submit(get_unusual_options_activity, "NIFTY")
+                bulk = _fb.result(); block = _fbl.result(); uoa = _fo.result()
+
+            if bulk:
+                st.markdown('<div class="sec-label">Bulk Deals (Last 5 days)</div>', unsafe_allow_html=True)
+                for d in bulk[:8]:
+                    dt_col = "#1A6B3C" if d["deal_type"].upper() in ("BUY","B") else "#8B1A1A"
+                    inst_badge = '<span style="background:#EEF1F8;padding:2px 6px;border-radius:1px;font-size:10px;color:#1B2A4A;font-weight:700;"> INST</span>' if d["is_institutional"] else ""
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;padding:8px 14px;'
+                        f'background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {dt_col};'
+                        f'border-radius:2px;margin-bottom:4px;flex-wrap:wrap;gap:6px;">'
+                        f'<div><b style="color:#1B2A4A;">{d["symbol"]}</b>&nbsp;'
+                        f'<span style="color:{dt_col};font-weight:700;">{d["deal_type"].upper()}</span>'
+                        f'{inst_badge}&nbsp;<span style="color:#6B82B0;font-size:11px;">{d["client_name"][:35]}</span></div>'
+                        f'<div style="font-size:12px;">₹<b>{d["value_cr"]:.1f} Cr</b>&nbsp;|&nbsp;{d["date"]}</div></div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.info("No bulk deals found for this period/symbol.")
+
+            if block:
+                st.markdown('<div class="sec-label">Block Deals</div>', unsafe_allow_html=True)
+                for d in block[:5]:
+                    dt_col = "#1A6B3C" if d["deal_type"].upper() in ("BUY","B") else "#8B1A1A"
+                    st.markdown(f'<div style="padding:8px 14px;background:#F8F9FC;border-left:3px solid {dt_col};border-radius:2px;margin-bottom:4px;font-size:12px;"><b style="color:#1B2A4A;">{d["symbol"]}</b> — <span style="color:{dt_col};font-weight:700;">{d["deal_type"].upper()}</span> — {d["client_name"][:35]} — ₹<b>{d["value_cr"]:.1f} Cr</b></div>', unsafe_allow_html=True)
+
+            if uoa.get("success") and uoa.get("unusual"):
+                st.markdown('<div class="sec-label">Unusual Options Activity (NIFTY)</div>', unsafe_allow_html=True)
+                st.markdown(f'<div style="background:#EEF1F8;border-radius:2px;padding:10px 14px;margin-bottom:8px;font-size:12px;color:#1B2A4A;">{uoa["summary"]}</div>', unsafe_allow_html=True)
+                for u in uoa["unusual"][:6]:
+                    uc = "#1A6B3C" if u.get("bullish") else "#8B1A1A" if u.get("bullish") is False else "#8B6914"
+                    st.markdown(f'<div style="padding:6px 12px;border-left:3px solid {uc};background:#F8F9FC;border-radius:2px;margin-bottom:4px;font-size:12px;">Strike <b>{u["strike"]:,}</b>: {u["signal"]} ({u["vs_avg"]}x avg OI)</div>', unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — SETTINGS & POSITION SIZING (moved from tab4)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.markdown('<div style="font-size:13px;color:#6B82B0;margin-bottom:20px;">Configure capital, risk tolerance, position sizing, and VPS deployment.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-label">Capital & Risk Configuration</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        capital = st.number_input("Total Trading Capital (₹)", min_value=10000, max_value=100000000,
+            value=int(st.session_state.get("capital", 500000)), step=10000, format="%d", key="capital_input")
+        st.session_state["capital"] = capital
+    with c2:
+        risk_pct = st.number_input("Max Risk Per Trade (%)", min_value=0.5, max_value=5.0,
+            value=float(st.session_state.get("risk_pct", 1.5)), step=0.5, format="%.1f", key="risk_pct_input")
+        st.session_state["risk_pct"] = risk_pct
+    with c3:
+        max_trades = st.number_input("Max Simultaneous Trades", min_value=1, max_value=10,
+            value=int(st.session_state.get("max_trades", 3)), step=1, key="max_trades_input")
+        st.session_state["max_trades"] = max_trades
+
+    max_risk = capital * risk_pct / 100
+    st.markdown(f"""
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px;margin-bottom:24px;">
+      <div style="background:#EEF1F8;border-top:2px solid #1B2A4A;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Total Capital</div><div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#1B2A4A;">₹{capital:,.0f}</div></div>
+      <div style="background:#EBF5F0;border-top:2px solid #1A6B3C;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Risk / Trade</div><div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#1A6B3C;">₹{max_risk:,.0f}</div></div>
+      <div style="background:#FBF8F0;border-top:2px solid #8B6914;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Open Trades</div><div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#8B6914;">{max_trades}</div></div>
+      <div style="background:#FAECEC;border-top:2px solid #8B1A1A;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Total Risk</div><div style="font-family:'EB Garamond',serif;font-size:20px;font-weight:600;color:#8B1A1A;">₹{max_risk*max_trades:,.0f}</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-label">Position Sizing Calculator</div>', unsafe_allow_html=True)
+    from live_data import calculate_position_size
+    ps1, ps2, ps3 = st.columns(3)
+    with ps1:
+        ps_instr = st.text_input("Instrument", placeholder="e.g. HDFCBANK", key="ps_instr")
+        ps_type  = st.selectbox("Type", ["Equity (CNC)","Equity (Intraday)","Options (Buy)","Futures"], key="ps_type")
+    with ps2:
+        ps_entry = st.number_input("Entry Price (₹)", 0.0, value=0.0, step=0.5, key="ps_entry")
+        ps_sl    = st.number_input("Stop Loss (₹)", 0.0, value=0.0, step=0.5, key="ps_sl")
+    with ps3:
+        ps_target = st.number_input("Target Price (₹)", 0.0, value=0.0, step=0.5, key="ps_target")
+        ps_lot    = st.number_input("Lot Size (F&O)", min_value=1, value=75, step=1, key="ps_lot")
+
+    if st.button("Calculate", key="ps_calc"):
+        if ps_entry > 0 and ps_sl > 0:
+            is_opts = "Options" in ps_type
+            lev = 5.0 if "Intraday" in ps_type else 1.0
+            sizing = calculate_position_size(capital=capital, risk_pct=risk_pct,
+                entry_price=ps_entry, stop_loss_price=ps_sl,
+                lot_size=ps_lot if is_opts else 1,
+                is_options=is_opts, premium=ps_entry if is_opts else 0, leverage=lev)
+            if sizing.get("success"):
+                qty = sizing.get("lots", sizing.get("quantity", 0))
+                rr  = round(abs(ps_target-ps_entry)/abs(ps_entry-ps_sl),2) if ps_target > 0 else "—"
+                st.markdown(f"""
+                <div style="background:#EEF1F8;border-top:3px solid #1B2A4A;border-radius:2px;padding:20px;margin-top:10px;">
+                  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;">
+                    <div style="background:#fff;border:1px solid #DCE1EC;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">{"Lots" if is_opts else "Shares"} to Trade</div><div style="font-family:'EB Garamond',serif;font-size:28px;font-weight:600;color:#1B2A4A;">{qty}</div></div>
+                    <div style="background:#FAECEC;border:1px solid #F0BABA;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Max Loss</div><div style="font-family:'EB Garamond',serif;font-size:24px;font-weight:600;color:#8B1A1A;">₹{sizing["max_loss"]:,.0f}</div><div style="font-size:10px;color:#6B82B0;">{sizing["max_loss_pct"]:.1f}% of capital</div></div>
+                    <div style="background:#FBF8F0;border:1px solid #C9A84C44;border-radius:2px;padding:12px;text-align:center;"><div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">Risk:Reward</div><div style="font-family:'EB Garamond',serif;font-size:28px;font-weight:600;color:#8B6914;">1:{rr}</div></div>
+                  </div>
+                  <div style="font-size:13px;color:#2C4070;">Order Value: <b>₹{sizing.get("order_value",sizing.get("total_premium_outlay",0)):,.0f}</b> | Capital Used: <b>{sizing.get("capital_used_pct",sizing.get("capital_at_risk",0)):.1f}%</b></div>
+                </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-label">VPS Deployment — Tier 1</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="background:#EEF1F8;border:1px solid #C5D0E6;border-left:3px solid #1B2A4A;border-radius:2px;padding:16px 18px;margin-bottom:12px;">
+    <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:8px;">MOVE TO VPS FOR PRODUCTION RELIABILITY</div>
+    <div style="font-size:13px;color:#2C4070;line-height:1.9;">
+    Streamlit Community Cloud can cold-start (30-60 seconds), timeout background threads, and has no uptime SLA.<br>
+    For a live trading system, move to a dedicated VPS:<br><br>
+    <b>Recommended:</b> DigitalOcean Basic Droplet ($6/month) or AWS Lightsail ($5/month)<br>
+    <b>Deploy:</b> The <code>deploy_vps.sh</code> script in your repo sets up the full environment automatically.<br>
+    <b>Result:</b> Persistent server, systemd auto-restart, Nginx proxy, logs via journalctl.
+    </div></div>
+    """, unsafe_allow_html=True)
+    st.code("# On your VPS:\ngit clone https://github.com/dinumathew/hivemind-alpha.git\ncd hivemind-alpha\nchmod +x deploy_vps.sh\nsudo ./deploy_vps.sh", language="bash")
