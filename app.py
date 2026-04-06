@@ -23,6 +23,9 @@ from groww_data import (
 )
 from telegram_bot import (
     test_telegram_connection, notify_and_await_approval,
+    send_trade_alert, check_for_approval, execute_on_groww,
+    send_execution_confirmation, send_rejection_confirmation,
+    build_approval_keyboard,
 )
 from trade_log import log_signal, update_status, get_summary, get_all
 from scanner import get_scanner, is_market_open, run_scan_cycle
@@ -323,10 +326,20 @@ with st.sidebar:
                 st.rerun()
         with col_b:
             if st.button("🔍 Scan Now", key="scanner_force", use_container_width=True):
+                tg_sb  = st.secrets.get("TELEGRAM_BOT_TOKEN","")
+                ch_sb  = st.secrets.get("TELEGRAM_CHAT_ID","")
+                gw_sb  = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+                ak_sb  = st.secrets.get("ANTHROPIC_API_KEY","")
+                def _sb_ctx():
+                    from groww_data import build_market_context_groww
+                    return build_market_context_groww(gw_sb)
+                scanner.configure(ak_sb, tg_sb, ch_sb, gw_sb, _sb_ctx)
                 with st.spinner("Scanning…"):
                     r = scanner.force_scan()
                 if r.get("fired"):
-                    st.success(f"Signal fired: {r.get('instrument','?')} {r.get('direction','?')}")
+                    st.success(f"🎯 {r.get('direction','?')} {r.get('instrument','?')} — check Telegram!")
+                elif r.get("error"):
+                    st.error(f"Error: {r.get('error','')[:80]}")
                 else:
                     st.info(f"No signal: {r.get('reason','')[:60]}")
 
@@ -485,34 +498,41 @@ def build_query_msg(q, mode, market_ctx="", enriched_ctx=""):
     now = datetime.now(IST).strftime("%d %b %Y %H:%M IST")
     ctx_block      = f"\n{market_ctx}\n" if market_ctx else ""
     enriched_block = f"\n{enriched_ctx}\n" if enriched_ctx else ""
+    no_live_warning = "" if (market_ctx or enriched_ctx) else "\n⚠ NO LIVE DATA AVAILABLE — Use your best judgment but clearly state uncertainty about current prices.\n"
     return f"""INVESTMENT QUERY: "{q}"
 MODE: {mode.upper()} | SENSEX (BSE) / NIFTY (NSE)
 TIMESTAMP: {now}
-{ctx_block}{enriched_block}
-Provide your expert analysis using ALL the live data above — market data, fundamentals,
-technicals, earnings, and news. Anchor every claim to specific numbers from the data.
+
+{'='*60}
+AUTHORITATIVE LIVE MARKET DATA — USE THESE EXACT PRICES:
+{'='*60}
+{ctx_block}{enriched_block}{no_live_warning}
+MANDATORY: Every price, level, RSI, P/E, or ratio you cite MUST come from the live data above.
+Your training data prices are OUTDATED. The live data above is the ONLY truth.
+Entry price, stop-loss, and targets MUST be based on the live prices shown above.
 
 Structure:
-1. KEY SIGNAL / OPPORTUNITY (cite specific data points — P/E, RSI, FII flows, earnings)
-2. CRITICAL RISK FACTOR (with specific levels)
-3. SPECIFIC RECOMMENDATION (Bullish/Bearish/Neutral with exact entry/SL/target levels)
-4. ONE CONTRARIAN TAKE
+1. KEY SIGNAL (cite exact live data points — e.g. "RELIANCE at ₹1,312, RSI 41, near 20DMA support at ₹1,298")
+2. CRITICAL RISK (with exact levels from live data)
+3. RECOMMENDATION (Bullish/Bearish/Neutral with entry/SL/targets derived from live price)
+4. CONTRARIAN TAKE
 
-Be institutional-grade specific. Max 300 words."""
+Be precise. Reference specific live numbers. Max 300 words."""
 
 
-def build_consensus_msg(q, mode, analyses):
+def build_consensus_msg(q, mode, analyses, market_ctx=""):
     summaries = "\n\n".join([
         f"=== {a['name']} ({a['legend']}) ===\n{analyses.get(a['id'],'N/A')[:400]}"
         for a in AGENTS if a["id"] in analyses
     ])
+    live_block = f"LIVE MARKET DATA:\n{market_ctx[:800]}\n\n" if market_ctx else ""
     return f"""QUERY: "{q}" | MODE: {mode.upper()}
-SENSEX ≈ 73,000–80,000 | NIFTY 50 ≈ 22,000–25,000 | BANKNIFTY ≈ 48,000–52,000
 
-AGENT ANALYSES:
+{live_block}AGENT ANALYSES:
 {summaries}
 
-Synthesize into a final consensus with SPECIFIC ACTIONABLE TRADES.
+Synthesize into final consensus. Entry/SL/targets MUST match the live prices above.
+If live data shows a stock at ₹1,300, entry must be near ₹1,300 — NOT ₹2,300 or any other level.
 You MUST provide exact rupee prices — not vague ranges, not percentages alone.
 Respond ONLY in valid JSON (no markdown, no backticks):
 {{
@@ -779,6 +799,36 @@ def render_cs(data, raw):
 
 
 # ── TABS ───────────────────────────────────────────────────────────────────────
+def _exec_approved(pending: dict, groww_tok: str,
+                    tg_token: str, tg_chat: str, trade_id: str):
+    """Execute approved trade on Groww and update journal."""
+    consensus = pending["consensus"]
+    eq = consensus.get("equity_trade", {})
+    op = consensus.get("options_trade", {})
+    results = {}
+    if pending.get("has_eq") and eq.get("applicable"):
+        r = execute_on_groww(groww_tok, eq, "equity")
+        results["equity"] = r
+        send_execution_confirmation(tg_token, tg_chat, r, trade_id + "_EQ")
+        if r.get("success"):
+            st.success(f"✅ Equity order placed: {r['message']}")
+            if r.get("oco_id"):
+                st.info(f"OCO (SL+Target) active: {r['oco_id']}")
+        else:
+            st.error(f"Equity order failed: {r.get('message','')}")
+    if pending.get("has_op") and op.get("applicable"):
+        r = execute_on_groww(groww_tok, op, "options")
+        results["options"] = r
+        send_execution_confirmation(tg_token, tg_chat, r, trade_id + "_OP")
+        if r.get("success"):
+            st.success(f"✅ Options order placed: {r['message']}")
+        else:
+            st.error(f"Options order failed: {r.get('message','')}")
+    update_status(trade_id, "EXECUTED", decision="approved",
+                  order_id=str(results))
+    st.session_state.pop("pending_approval", None)
+
+
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["▪  Hive Mind Analysis","▪  Daily Trade Desk","▪  Market Analytics","▪  Auto Scanner","▪  Intelligence Hub","▪  Settings & Sizing"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1013,7 +1063,7 @@ with tab1:
         try:
             with client_ai.messages.stream(model="claude-sonnet-4-20250514",max_tokens=1500,
                                            system=CONSENSUS_CONFIG["system"],
-                                           messages=[{"role":"user","content":build_consensus_msg(query,mode,final)}]) as s:
+                                           messages=[{"role":"user","content":build_consensus_msg(query,mode,final,market_ctx)}]) as s:
                 for chunk in s.text_stream: raw+=chunk
         except Exception as e:
             raw=f'{{"overall_stance":"NEUTRAL","narrative":"Error: {e}"}}'
@@ -1122,27 +1172,66 @@ with tab1:
             if send_btn:
                 if has_eq: data["equity_trade"]["quantity"] = int(st.session_state.get("eq_qty",1))
                 if has_op: data["options_trade"]["quantity"] = int(st.session_state.get("op_qty",1))
-                update_status(trade_id,"SENT_TO_TELEGRAM")
-                with st.spinner("⏳ Waiting for your Telegram approval (5 min timeout)…"):
-                    result = notify_and_await_approval(
-                        consensus=data, groww_token=groww_tok,
-                        telegram_token=tg_token, telegram_chat_id=tg_chat,
-                        approval_timeout=300, trade_id=trade_id,
-                    )
-                decision = result.get("decision","timeout")
-                if decision == "approved":
-                    update_status(trade_id,"EXECUTED",decision="approved",order_id=str(result.get("results",{})))
-                    st.success(f"✅ Trade approved and sent to Groww! ID: {trade_id}")
-                    for kind,(key) in [("Equity","equity"),("Options","options")]:
-                        r = result.get("results",{}).get(key,{})
-                        if r.get("success"): st.info(f"{kind}: {r['message']}")
-                        elif r: st.error(f"{kind} error: {r.get('message','')}")
-                elif decision == "rejected":
-                    update_status(trade_id,"REJECTED",decision="rejected")
-                    st.warning(f"❌ Trade rejected. No order placed. ID: {trade_id}")
+                trade_type = "both" if (has_eq and has_op) else "equity" if has_eq else "options"
+                # NON-BLOCKING: send alert and get offset, return immediately
+                alert_info = send_trade_alert(tg_token, tg_chat, trade_id, data, trade_type)
+                if alert_info.get("sent"):
+                    update_status(trade_id,"SENT_TO_TELEGRAM")
+                    # Store pending approval data in session state
+                    st.session_state["pending_approval"] = {
+                        "trade_id":   trade_id,
+                        "consensus":  data,
+                        "offset":     alert_info.get("offset_before", 0),
+                        "tg_token":   tg_token,
+                        "tg_chat":    tg_chat,
+                        "groww_tok":  groww_tok,
+                        "has_eq":     has_eq,
+                        "has_op":     has_op,
+                    }
+                    st.success(f"✅ Alert sent to Telegram! Trade ID: **{trade_id}**")
+                    st.info("👆 Tap **APPROVE** or **REJECT** on your phone, then click the button below.")
                 else:
-                    update_status(trade_id,"TIMEOUT",decision="timeout")
-                    st.warning(f"⏰ Approval timed out. No order placed. ID: {trade_id}")
+                    st.error("Failed to send Telegram message. Check your bot token and chat ID in Secrets.")
+
+            # ── Check Approval Button (shown after alert sent) ───────────────
+            pending = st.session_state.get("pending_approval", {})
+            if pending.get("trade_id") == trade_id:
+                st.markdown("---")
+                cc1, cc2, cc3 = st.columns([1,1,1])
+                with cc1:
+                    check_btn = st.button("🔍 Check Approval Status", key="check_approval", use_container_width=True)
+                with cc2:
+                    manual_approve = st.button("✅ Mark as Approved (Manual)", key="manual_approve", use_container_width=True)
+                with cc3:
+                    manual_reject  = st.button("❌ Mark as Rejected (Manual)", key="manual_reject", use_container_width=True)
+
+                if check_btn:
+                    with st.spinner("Checking Telegram for your response…"):
+                        check = check_for_approval(
+                            pending["tg_token"], pending["tg_chat"],
+                            pending["trade_id"], pending["offset"]
+                        )
+                    decision = check.get("decision","pending")
+                    pending["offset"] = check.get("new_offset", pending["offset"])
+                    st.session_state["pending_approval"] = pending
+
+                    if decision == "approved":
+                        _exec_approved(pending, groww_tok, tg_token, tg_chat, trade_id)
+                    elif decision == "rejected":
+                        update_status(trade_id,"REJECTED",decision="rejected")
+                        send_rejection_confirmation(tg_token, tg_chat, trade_id)
+                        st.warning(f"❌ Trade rejected. No order placed.")
+                        st.session_state.pop("pending_approval", None)
+                    else:
+                        st.info("No response yet. Tap Approve/Reject on Telegram first, then click Check again.")
+
+                if manual_approve:
+                    _exec_approved(pending, groww_tok, tg_token, tg_chat, trade_id)
+
+                if manual_reject:
+                    update_status(trade_id,"REJECTED",decision="rejected")
+                    st.warning("❌ Marked as rejected.")
+                    st.session_state.pop("pending_approval", None)
         elif tg_token and tg_chat:
             st.info("No actionable trade in this analysis. No Telegram alert sent.")
         else:
@@ -1504,21 +1593,33 @@ if all_trades:
         sc = {"EXECUTED":"#1A6B3C","REJECTED":"#8B1A1A","TIMEOUT":"#8B6914",
               "PENDING_APPROVAL":"#1B2A4A","SENT_TO_TELEGRAM":"#8B6914"}.get(status,"#6B82B0")
         pnl_str = f"₹{t['pnl']:,.0f}" if t.get("pnl") is not None else "—"
-        st.markdown(
-            f'<div style="display:flex;justify-content:space-between;align-items:center;'
-            f'padding:10px 14px;background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {sc};'
-            f'border-radius:2px;margin-bottom:6px;flex-wrap:wrap;gap:8px;">'
-            f'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#1B2A4A;font-weight:700;">'
-            f'{t["trade_id"]}</span>&nbsp;&nbsp;'
-            f'<span style="font-size:12px;color:#2C4070;">{t.get("query","—")[:50]}</span></div>'
-            f'<div style="display:flex;gap:12px;align-items:center;">'
-            f'<span style="font-size:11px;color:{sc};font-weight:700;">{status}</span>'
-            f'<span style="font-size:11px;color:#6B82B0;">{t["timestamp"][:16].replace("T"," ")}</span>'
-            f'<span style="font-size:11px;color:{"#1A6B3C" if pnl_str!="—" and float(t.get("pnl",0))>=0 else "#8B1A1A" if pnl_str!="—" else "#9B9B9B"};">'
-            f'P&L: {pnl_str}</span>'
-            f'</div></div>',
-            unsafe_allow_html=True
-        )
+        jcol1, jcol2 = st.columns([5, 1])
+        with jcol1:
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:10px 14px;background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {sc};'
+                f'border-radius:2px;margin-bottom:4px;flex-wrap:wrap;gap:8px;">'
+                f'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#1B2A4A;font-weight:700;">'
+                f'{t["trade_id"]}</span>&nbsp;&nbsp;'
+                f'<span style="font-size:12px;color:#2C4070;">{t.get("query","—")[:50]}</span></div>'
+                f'<div style="display:flex;gap:12px;align-items:center;">'
+                f'<span style="font-size:11px;color:{sc};font-weight:700;">{status}</span>'
+                f'<span style="font-size:11px;color:#6B82B0;">{t["timestamp"][:16].replace("T"," ")}</span>'
+                f'<span style="font-size:11px;color:{"#1A6B3C" if pnl_str!="—" and float(t.get("pnl",0))>=0 else "#8B1A1A" if pnl_str!="—" else "#9B9B9B"};">'
+                f'P&L: {pnl_str}</span>'
+                f'</div></div>',
+                unsafe_allow_html=True
+            )
+        with jcol2:
+            if status in ("PENDING_APPROVAL","SENT_TO_TELEGRAM"):
+                if st.button("✅ Exec", key=f"jexec_{t['trade_id']}", use_container_width=True,
+                             help="Mark this trade as executed (use if you approved on Telegram but status didn't update)"):
+                    update_status(t["trade_id"],"EXECUTED",decision="approved")
+                    st.rerun()
+                if st.button("❌ Reject", key=f"jrej_{t['trade_id']}", use_container_width=True,
+                             help="Mark this trade as rejected"):
+                    update_status(t["trade_id"],"REJECTED",decision="rejected")
+                    st.rerun()
 else:
     st.markdown('<div style="text-align:center;padding:24px;color:#B8C2D8;font-size:12px;letter-spacing:2px;">No trades logged yet. Run an analysis to generate your first signal.</div>',
                 unsafe_allow_html=True)
@@ -1582,19 +1683,23 @@ with tab4:
                     st.rerun()
         with b2:
             if st.button("Scan Now", key="sc_now", use_container_width=True):
-                if not scanner.running:
-                    def _ctx2():
-                        from groww_data import build_market_context_groww
-                        return build_market_context_groww(groww_tok_sc)
-                    scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc, groww_tok_sc, _ctx2)
-                with st.spinner("Scanning with all 8 agents..."):
+                # Always reconfigure — handles cold start and session resets
+                def _ctx2():
+                    from groww_data import build_market_context_groww
+                    return build_market_context_groww(groww_tok_sc)
+                scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc, groww_tok_sc, _ctx2)
+                with st.spinner("📡 Fetching live data + scanning with all 8 agents…"):
                     result = scanner.force_scan()
                 if result.get("fired"):
-                    st.success("Signal fired: " + str(result.get("direction","")) + " " + str(result.get("instrument","")) + " — check Telegram!")
+                    st.success(f"🎯 Signal: {result.get('direction','')} {result.get('instrument','')} ({result.get('conviction','')}) — check Telegram!")
                 elif result.get("error"):
-                    st.error("Error: " + str(result["error"]))
+                    st.error(f"Error: {result['error']}")
+                    st.caption("Verify GROWW_API_TOKEN and ANTHROPIC_API_KEY in Streamlit Secrets.")
                 else:
-                    st.info("No signal: " + str(result.get("reason",""))[:80])
+                    reason = result.get("reason","")
+                    st.info(f"No signal: {reason[:120]}")
+                    if "Only 0" in reason or "Only 1" in reason:
+                        st.caption("Not enough agents agreed on a direction. Market conditions may be mixed.")
         with b3:
             if st.button("Refresh", key="sc_refresh", use_container_width=True):
                 st.rerun()

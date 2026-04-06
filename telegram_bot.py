@@ -1,6 +1,15 @@
 """
-telegram_bot.py — Telegram trade alerts + human approval + Groww execution
+telegram_bot.py — Telegram notification + non-blocking approval + Groww execution
 HIVE MIND ALPHA
+
+APPROVAL ARCHITECTURE (non-blocking):
+Step 1: send_trade_alert() — fires message to Telegram, returns immediately
+Step 2: check_for_approval() — called by user clicking "Check Approval" button in app
+        Polls Telegram getUpdates once, looks for approve/reject callback
+        If found: executes on Groww immediately
+        
+This two-step pattern is required for Streamlit Cloud which cannot hold
+a blocking thread for 5 minutes.
 """
 
 import requests
@@ -9,51 +18,43 @@ import time
 import threading
 from datetime import datetime
 import pytz
-import streamlit as st
+import uuid
 
 IST = pytz.timezone("Asia/Kolkata")
-
 
 # ── Telegram API helpers ───────────────────────────────────────────────────────
 
 def send_telegram_message(token: str, chat_id: str, text: str,
-                           reply_markup: dict = None) -> dict:
-    """Send a message via Telegram Bot API."""
+                          reply_markup: dict = None) -> dict:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
+        "chat_id":   chat_id,
+        "text":      text,
+        "parse_mode":"HTML",
         "disable_web_page_preview": True,
     }
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=15)
         return resp.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-def edit_telegram_message(token: str, chat_id: str, message_id: int,
-                           text: str) -> dict:
-    """Edit an existing Telegram message."""
+def edit_telegram_message(token: str, chat_id: str, message_id: int, text: str) -> dict:
     url = f"https://api.telegram.org/bot{token}/editMessageText"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-    }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json={
+            "chat_id": chat_id, "message_id": message_id,
+            "text": text, "parse_mode": "HTML",
+        }, timeout=10)
         return resp.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 def answer_callback_query(token: str, callback_query_id: str, text: str = "") -> dict:
-    """Acknowledge a button press so the loading spinner disappears."""
     url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
     try:
         resp = requests.post(url, json={
@@ -65,14 +66,14 @@ def answer_callback_query(token: str, callback_query_id: str, text: str = "") ->
         return {"ok": False, "error": str(e)}
 
 
-def get_updates(token: str, offset: int = 0, timeout: int = 20) -> list:
-    """Long-poll for new updates (button presses)."""
+def get_updates(token: str, offset: int = 0, timeout: int = 3) -> list:
+    """Short-poll for updates. timeout=3 for non-blocking use."""
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     try:
         resp = requests.get(url, params={
-            "offset": offset,
+            "offset":  offset,
             "timeout": timeout,
-            "allowed_updates": ["callback_query"],
+            "allowed_updates": ["callback_query", "message"],
         }, timeout=timeout + 5)
         data = resp.json()
         return data.get("result", [])
@@ -80,16 +81,22 @@ def get_updates(token: str, offset: int = 0, timeout: int = 20) -> list:
         return []
 
 
+def get_latest_offset(token: str) -> int:
+    """Get the current latest update_id so we only see NEW updates after this point."""
+    updates = get_updates(token, offset=0, timeout=1)
+    if updates:
+        return updates[-1]["update_id"] + 1
+    return 0
+
+
 # ── Trade alert formatting ─────────────────────────────────────────────────────
 
 def format_equity_alert(trade_id: str, consensus: dict, eq: dict) -> str:
-    """Format a rich equity trade alert message for Telegram."""
     stance     = consensus.get("overall_stance", "NEUTRAL")
     conviction = consensus.get("conviction", "—")
     agree      = consensus.get("agent_agreement_pct", "—")
     thesis     = consensus.get("key_thesis", "")
     now        = datetime.now(IST).strftime("%d %b %Y %H:%M IST")
-
     direction  = eq.get("direction", "BUY")
     instrument = eq.get("instrument", "—")
     entry      = eq.get("entry_price", "—")
@@ -102,489 +109,387 @@ def format_equity_alert(trade_id: str, consensus: dict, eq: dict) -> str:
     holding    = eq.get("holding_period", "—")
     entry_cond = eq.get("entry_condition", "—")
     inv        = eq.get("invalidation", "—")
-
-    dir_emoji  = "🟢" if direction == "BUY" else "🔴"
-    st_emoji   = "🚀" if stance == "BULLISH" else "⬇️" if stance == "BEARISH" else "⚖️"
-
+    de = "🟢" if direction in ("BUY","LONG") else "🔴"
+    se = "🚀" if stance in ("BULLISH","LONG") else "⬇️" if stance in ("BEARISH","SHORT") else "⚖️"
     return (
         f"🧠 <b>HIVE MIND ALPHA — TRADE SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {now}\n"
         f"📋 Trade ID: <code>{trade_id}</code>\n\n"
-        f"{st_emoji} <b>Stance:</b> {stance}  |  Conviction: <b>{conviction}</b>\n"
+        f"{se} <b>Stance:</b> {stance}  |  <b>{conviction}</b> conviction\n"
         f"🤝 Agent Agreement: <b>{agree}%</b>\n\n"
         f"━━━━━━━━ EQUITY TRADE ━━━━━━━━\n"
-        f"{dir_emoji} <b>{direction} {instrument}</b>\n\n"
+        f"{de} <b>{direction} {instrument}</b>\n\n"
         f"📥 <b>Entry:</b> {entry}\n"
         f"🛑 <b>Stop Loss:</b> {sl}\n"
-        f"🎯 <b>T1 (Conservative):</b> {t1}\n"
-        f"🎯 <b>T2 (Primary):</b> {t2}\n"
-        f"🎯 <b>T3 (Stretch):</b> {t3}\n"
+        f"🎯 <b>T1:</b> {t1}  |  <b>T2:</b> {t2}  |  <b>T3:</b> {t3}\n"
         f"⚖️ <b>Risk:Reward:</b> {rr}\n"
-        f"💼 <b>Position Size:</b> {size}\n"
-        f"⏱ <b>Holding Period:</b> {holding}\n\n"
-        f"📌 <b>Entry Condition:</b>\n{entry_cond}\n\n"
-        f"❌ <b>Invalidated If:</b>\n{inv}\n\n"
-        f"💡 <b>Thesis:</b>\n<i>{thesis}</i>\n"
+        f"💼 <b>Size:</b> {size}\n"
+        f"⏱ <b>Hold:</b> {holding}\n\n"
+        f"📌 <b>Entry When:</b> {entry_cond}\n"
+        f"❌ <b>Invalidated If:</b> {inv}\n\n"
+        f"💡 <i>{thesis[:200]}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>Educational purposes only. Not SEBI-registered advice.</i>"
+        f"👇 <b>Tap a button to decide:</b>"
     )
 
 
 def format_options_alert(trade_id: str, consensus: dict, op: dict) -> str:
-    """Format a rich options trade alert for Telegram."""
-    stance     = consensus.get("overall_stance", "NEUTRAL")
-    conviction = consensus.get("conviction", "—")
-    agree      = consensus.get("agent_agreement_pct", "—")
-    now        = datetime.now(IST).strftime("%d %b %Y %H:%M IST")
-
-    strategy   = op.get("strategy", "—")
-    underlying = op.get("underlying", "—")
-    expiry     = op.get("expiry", "—")
-    holding    = op.get("holding_period", "—")
-    leg1       = op.get("leg_1", {})
-    net_prem   = op.get("net_premium", "—")
-    max_loss   = op.get("max_loss", "—")
-    max_profit = op.get("max_profit", "—")
-    breakeven  = op.get("breakeven", "—")
-    exit_prem  = op.get("target_exit_premium", "—")
-    sl_prem    = op.get("stop_loss_premium", "—")
-    entry_time = op.get("ideal_entry_time", "—")
-    theta      = op.get("theta_risk", "—")
-    vix_cond   = op.get("vix_condition", "—")
-
-    l1_action  = leg1.get("action", "BUY")
-    l1_type    = leg1.get("type", "CE")
-    l1_strike  = leg1.get("strike", "—")
-    l1_prem    = leg1.get("premium", "—")
-    l1_delta   = leg1.get("delta", "—")
-
-    leg2       = op.get("leg_2", {})
-    leg2_html  = ""
-    if leg2.get("action") not in ("N/A", "", None):
-        leg2_html = (
-            f"\n🔸 <b>Leg 2:</b> {leg2.get('action','—')} "
-            f"{leg2.get('type','—')} {leg2.get('strike','—')} "
-            f"@ {leg2.get('premium','—')} (Δ {leg2.get('delta','—')})"
-        )
-
-    st_emoji = "🚀" if stance == "BULLISH" else "⬇️" if stance == "BEARISH" else "⚖️"
-
+    stance    = consensus.get("overall_stance", "NEUTRAL")
+    conviction= consensus.get("conviction", "—")
+    agree     = consensus.get("agent_agreement_pct", "—")
+    now       = datetime.now(IST).strftime("%d %b %Y %H:%M IST")
+    strategy  = op.get("strategy", "—")
+    underlying= op.get("underlying", "—")
+    expiry    = op.get("expiry", "—")
+    leg1      = op.get("leg_1", {})
+    l1a = leg1.get("action","BUY"); l1t = leg1.get("type","CE")
+    l1s = leg1.get("strike","—");   l1p = leg1.get("premium","—")
+    l1d = leg1.get("delta","—")
+    leg2     = op.get("leg_2", {})
+    leg2_txt = ""
+    if leg2.get("action") not in ("N/A","",None):
+        leg2_txt = (f"\n🔸 Leg 2: {leg2.get('action','—')} {leg2.get('type','—')} "
+                    f"{leg2.get('strike','—')} @ {leg2.get('premium','—')}")
     return (
         f"🧠 <b>HIVE MIND ALPHA — OPTIONS SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {now}\n"
         f"📋 Trade ID: <code>{trade_id}</code>\n\n"
-        f"{st_emoji} <b>Stance:</b> {stance}  |  Conviction: <b>{conviction}</b>\n"
-        f"🤝 Agent Agreement: <b>{agree}%</b>\n\n"
-        f"━━━━━━━━ OPTIONS TRADE ━━━━━━━━\n"
-        f"⚡ <b>{strategy}</b>\n"
-        f"📊 <b>Underlying:</b> {underlying}\n"
-        f"📅 <b>Expiry:</b> {expiry}  |  Hold: {holding}\n\n"
-        f"🔹 <b>Leg 1:</b> {l1_action} {l1_type} {l1_strike} "
-        f"@ {l1_prem} (Δ {l1_delta})"
-        f"{leg2_html}\n\n"
-        f"💰 <b>Net Premium:</b> {net_prem}\n"
-        f"🛑 <b>Max Loss:</b> {max_loss}\n"
-        f"🎯 <b>Max Profit:</b> {max_profit}\n"
-        f"⚖️ <b>Breakeven:</b> {breakeven}\n\n"
-        f"✅ <b>Exit at Premium:</b> {exit_prem}\n"
-        f"❌ <b>Stop at Premium:</b> {sl_prem}\n"
-        f"⏰ <b>Best Entry Time:</b> {entry_time}\n"
-        f"📉 <b>Theta Risk:</b> {theta}\n"
-        f"📊 <b>VIX Condition:</b> {vix_cond}\n"
+        f"⚡ <b>{strategy}</b> on {underlying}  |  {conviction} conviction\n"
+        f"🤝 Agreement: <b>{agree}%</b>  |  Expiry: {expiry}\n\n"
+        f"🔹 Leg 1: {l1a} {l1t} {l1s} @ {l1p} (Δ {l1d})"
+        f"{leg2_txt}\n\n"
+        f"💰 Net Premium: {op.get('net_premium','—')}\n"
+        f"🛑 Max Loss: {op.get('max_loss','—')}\n"
+        f"🎯 Max Profit: {op.get('max_profit','—')}\n"
+        f"⚖️ Breakeven: {op.get('breakeven','—')}\n"
+        f"✅ Exit at: {op.get('target_exit_premium','—')}\n"
+        f"❌ Stop at: {op.get('stop_loss_premium','—')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>Educational purposes only. Not SEBI-registered advice.</i>"
+        f"👇 <b>Tap a button to decide:</b>"
     )
 
 
 def build_approval_keyboard(trade_id: str) -> dict:
-    """Build inline keyboard with Approve / Reject / Details buttons."""
     return {
         "inline_keyboard": [[
             {"text": "✅ APPROVE & EXECUTE", "callback_data": f"approve_{trade_id}"},
-            {"text": "❌ REJECT",           "callback_data": f"reject_{trade_id}"},
+            {"text": "❌ REJECT",            "callback_data": f"reject_{trade_id}"},
         ], [
-            {"text": "📊 View Full Analysis", "callback_data": f"details_{trade_id}"},
+            {"text": "📊 View Analysis",     "callback_data": f"details_{trade_id}"},
         ]]
     }
 
 
-# ── Trade sender ───────────────────────────────────────────────────────────────
+# ── Step 1: Send alert (non-blocking) ─────────────────────────────────────────
 
 def send_trade_alert(token: str, chat_id: str, trade_id: str,
-                     consensus: dict, trade_type: str) -> int:
+                     consensus: dict, trade_type: str) -> dict:
     """
-    Send the appropriate trade alert and return the Telegram message_id.
-    trade_type: 'equity' | 'options' | 'both'
+    Send trade alert to Telegram. Returns immediately.
+    Also returns the offset to use when checking for approval later.
     """
     eq = consensus.get("equity_trade", {})
     op = consensus.get("options_trade", {})
     keyboard = build_approval_keyboard(trade_id)
 
-    # Send equity alert
-    eq_msg_id = None
+    # Get offset BEFORE sending so we only catch NEW responses
+    offset_before = get_latest_offset(token)
+
+    msg_id = None
     if trade_type in ("equity", "both") and eq.get("applicable"):
-        text = format_equity_alert(trade_id, consensus, eq)
+        text   = format_equity_alert(trade_id, consensus, eq)
         result = send_telegram_message(token, chat_id, text, keyboard)
         if result.get("ok"):
-            eq_msg_id = result["result"]["message_id"]
+            msg_id = result["result"]["message_id"]
 
-    # Send options alert
-    op_msg_id = None
     if trade_type in ("options", "both") and op.get("applicable"):
-        text = format_options_alert(trade_id, consensus, op)
+        text   = format_options_alert(trade_id, consensus, op)
         result = send_telegram_message(token, chat_id, text, keyboard)
         if result.get("ok"):
-            op_msg_id = result["result"]["message_id"]
+            msg_id = result["result"]["message_id"]
 
-    return eq_msg_id or op_msg_id or 0
+    return {
+        "sent":          True,
+        "message_id":    msg_id,
+        "offset_before": offset_before,
+        "trade_id":      trade_id,
+    }
 
 
-# ── Approval poller ────────────────────────────────────────────────────────────
+# ── Step 2: Check for approval (called by user clicking button) ────────────────
 
-class ApprovalPoller:
+def check_for_approval(token: str, chat_id: str, trade_id: str,
+                       offset: int = 0) -> dict:
     """
-    Polls Telegram for callback_query (button press) responses.
-    Run in a background thread.
+    Poll Telegram once for approve/reject callback for this trade_id.
+    Returns {decision: 'approved'|'rejected'|'pending', new_offset: int}
+    Call this when user clicks "Check Approval" button in the app.
     """
+    updates = get_updates(token, offset=offset, timeout=3)
+    new_offset = offset
 
-    def __init__(self, token: str, chat_id: str, trade_id: str,
-                 timeout_seconds: int = 300):
-        self.token       = token
-        self.chat_id     = str(chat_id)
-        self.trade_id    = trade_id
-        self.timeout     = timeout_seconds
-        self.result      = None          # 'approved' | 'rejected' | 'timeout'
-        self.callback_id = None
-        self._stop       = threading.Event()
+    for update in updates:
+        new_offset = update["update_id"] + 1
+        cq = update.get("callback_query")
+        if not cq:
+            continue
 
-    def poll(self):
-        offset   = 0
-        start    = time.time()
-        while not self._stop.is_set():
-            if time.time() - start > self.timeout:
-                self.result = "timeout"
-                break
+        data      = cq.get("data", "")
+        from_chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
 
-            updates = get_updates(self.token, offset=offset, timeout=10)
-            for update in updates:
-                offset = update["update_id"] + 1
-                cq = update.get("callback_query")
-                if not cq:
-                    continue
+        if from_chat != str(chat_id):
+            continue
 
-                data = cq.get("data", "")
-                from_chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+        if data == f"approve_{trade_id}":
+            answer_callback_query(token, cq["id"], "✅ Processing…")
+            return {"decision": "approved", "new_offset": new_offset,
+                    "callback_id": cq["id"]}
 
-                # Only process responses from our chat
-                if from_chat != self.chat_id:
-                    continue
+        elif data == f"reject_{trade_id}":
+            answer_callback_query(token, cq["id"], "❌ Rejected.")
+            return {"decision": "rejected", "new_offset": new_offset}
 
-                if data == f"approve_{self.trade_id}":
-                    self.result      = "approved"
-                    self.callback_id = cq["id"]
-                    answer_callback_query(self.token, cq["id"], "✅ Executing trade…")
-                    self._stop.set()
-                    break
+        elif data == f"details_{trade_id}":
+            answer_callback_query(token, cq["id"],
+                                  "Open the Hive Mind Alpha app for full analysis.")
 
-                elif data == f"reject_{self.trade_id}":
-                    self.result      = "rejected"
-                    self.callback_id = cq["id"]
-                    answer_callback_query(self.token, cq["id"], "❌ Trade rejected.")
-                    self._stop.set()
-                    break
-
-                elif data == f"details_{self.trade_id}":
-                    answer_callback_query(self.token, cq["id"],
-                                         "Open the Streamlit app for full analysis.")
-
-    def start(self):
-        t = threading.Thread(target=self.poll, daemon=True)
-        t.start()
-        return t
-
-    def wait_for_decision(self, check_interval: float = 0.5) -> str:
-        """Block until decision or timeout. Returns 'approved'|'rejected'|'timeout'."""
-        start = time.time()
-        while self.result is None:
-            if time.time() - start > self.timeout:
-                self.result = "timeout"
-                break
-            time.sleep(check_interval)
-        return self.result
+    return {"decision": "pending", "new_offset": new_offset}
 
 
 # ── Groww execution ────────────────────────────────────────────────────────────
 
-def execute_on_groww(access_token: str, trade: dict,
-                     trade_kind: str) -> dict:
-    """
-    Place an order on Groww via their official Python SDK.
-    trade_kind: 'equity' | 'options'
-    Returns dict with success, order_id, message.
-    """
+def execute_on_groww(access_token: str, trade: dict, trade_kind: str) -> dict:
     try:
         from growwapi import GrowwAPI
         groww = GrowwAPI(access_token)
     except ImportError:
-        return {"success": False, "message": "growwapi SDK not installed. Run: pip install growwapi"}
+        return {"success": False, "message": "growwapi not installed. Run: pip install growwapi"}
 
     try:
         if trade_kind == "equity":
             symbol    = trade.get("instrument", "").upper().replace(" ", "")
             direction = trade.get("direction", "BUY")
-            size_str  = trade.get("position_size", "1 share")
-
-            # Parse quantity — user sets this; default to 1 for safety
-            qty = int(trade.get("quantity", 1))
-
-            # Parse entry price (take midpoint of range if range given)
+            qty       = int(trade.get("quantity", 1))
             entry_raw = trade.get("entry_price", "0")
-            entry_price = _parse_price(entry_raw)
-
-            # Parse stop loss
             sl_raw    = trade.get("stop_loss", "0")
-            sl_price  = _parse_price(sl_raw)
-
-            # Parse target (use T2 as primary target)
             tgt_raw   = trade.get("target_2", "0")
-            tgt_price = _parse_price(tgt_raw)
+            entry_price = _parse_price(entry_raw)
+            sl_price    = _parse_price(sl_raw)
+            tgt_price   = _parse_price(tgt_raw)
+            holding     = trade.get("holding_period", "").lower()
+            product     = groww.PRODUCT_MIS if "intraday" in holding else groww.PRODUCT_CNC
 
-            # Determine product type based on holding period
-            holding = trade.get("holding_period", "").lower()
-            product = groww.PRODUCT_MIS if "intraday" in holding else groww.PRODUCT_CNC
-
-            # Place main entry order
             order_resp = groww.place_order(
-                trading_symbol=symbol,
-                quantity=qty,
-                validity=groww.VALIDITY_DAY,
-                exchange=groww.EXCHANGE_NSE,
-                segment=groww.SEGMENT_CASH,
-                product=product,
-                order_type=groww.ORDER_TYPE_LIMIT,
-                transaction_type=groww.TRANSACTION_TYPE_BUY if direction == "BUY"
-                                 else groww.TRANSACTION_TYPE_SELL,
-                price=entry_price,
+                trading_symbol   = symbol,
+                quantity         = qty,
+                validity         = groww.VALIDITY_DAY,
+                exchange         = groww.EXCHANGE_NSE,
+                segment          = groww.SEGMENT_CASH,
+                product          = product,
+                order_type       = groww.ORDER_TYPE_LIMIT,
+                transaction_type = (groww.TRANSACTION_TYPE_BUY
+                                    if direction in ("BUY","LONG")
+                                    else groww.TRANSACTION_TYPE_SELL),
+                price            = entry_price,
             )
-
             order_id = order_resp.get("groww_order_id", "")
 
-            # Place OCO (One-Cancels-the-Other) for SL + Target if intraday
             oco_id = None
             if product == groww.PRODUCT_MIS and sl_price and tgt_price:
-                oco_resp = groww.create_smart_order_oco(
-                    trading_symbol=symbol,
-                    quantity=qty,
-                    exchange=groww.EXCHANGE_NSE,
-                    segment=groww.SEGMENT_CASH,
-                    product=product,
-                    target={
-                        "trigger_price": tgt_price,
-                        "order_type": groww.ORDER_TYPE_LIMIT,
-                        "price": tgt_price,
-                    },
-                    stop_loss={
-                        "trigger_price": sl_price,
-                        "order_type": "SL_M",
-                        "price": None,
-                    },
-                )
-                oco_id = oco_resp.get("smart_order_id", "")
+                try:
+                    oco_resp = groww.create_smart_order_oco(
+                        trading_symbol = symbol,
+                        quantity       = qty,
+                        exchange       = groww.EXCHANGE_NSE,
+                        segment        = groww.SEGMENT_CASH,
+                        product        = product,
+                        target   = {"trigger_price": tgt_price,
+                                    "order_type": groww.ORDER_TYPE_LIMIT,
+                                    "price": tgt_price},
+                        stop_loss= {"trigger_price": sl_price,
+                                    "order_type": "SL_M", "price": None},
+                    )
+                    oco_id = oco_resp.get("smart_order_id", "")
+                except Exception:
+                    pass
 
             return {
                 "success":  True,
                 "order_id": order_id,
                 "oco_id":   oco_id,
-                "message":  f"Order placed: {direction} {qty} {symbol} @ ₹{entry_price:.2f}",
+                "message":  f"{direction} {qty} {symbol} @ ₹{entry_price:.2f}",
             }
 
         elif trade_kind == "options":
-            leg1   = trade.get("leg_1", {})
-            symbol = _build_options_symbol(trade, leg1)
-            action = leg1.get("action", "BUY")
-            prem_raw = leg1.get("premium", "0")
-            premium = _parse_price(prem_raw)
-            qty = int(trade.get("quantity", 1))  # in lots
+            leg1    = trade.get("leg_1", {})
+            symbol  = _build_options_symbol(trade, leg1)
+            action  = leg1.get("action", "BUY")
+            premium = _parse_price(leg1.get("premium", "0"))
+            qty     = int(trade.get("quantity", 1))
 
             order_resp = groww.place_order(
-                trading_symbol=symbol,
-                quantity=qty,
-                validity=groww.VALIDITY_DAY,
-                exchange=groww.EXCHANGE_NSE,
-                segment=groww.SEGMENT_FNO,
-                product=groww.PRODUCT_MIS,
-                order_type=groww.ORDER_TYPE_LIMIT,
-                transaction_type=groww.TRANSACTION_TYPE_BUY if action == "BUY"
-                                 else groww.TRANSACTION_TYPE_SELL,
-                price=premium,
+                trading_symbol   = symbol,
+                quantity         = qty,
+                validity         = groww.VALIDITY_DAY,
+                exchange         = groww.EXCHANGE_NSE,
+                segment          = groww.SEGMENT_FNO,
+                product          = groww.PRODUCT_MIS,
+                order_type       = groww.ORDER_TYPE_LIMIT,
+                transaction_type = (groww.TRANSACTION_TYPE_BUY
+                                    if action == "BUY"
+                                    else groww.TRANSACTION_TYPE_SELL),
+                price            = premium,
             )
-
             return {
                 "success":  True,
                 "order_id": order_resp.get("groww_order_id", ""),
-                "message":  f"Options order: {action} {symbol} @ ₹{premium:.2f}",
+                "message":  f"{action} {symbol} @ ₹{premium:.2f}",
             }
 
     except Exception as e:
         return {"success": False, "message": str(e)}
 
+    return {"success": False, "message": "Unknown trade_kind"}
+
 
 def _parse_price(raw: str) -> float:
-    """Extract a float price from strings like '₹1,640–1,660' or '₹85–95'."""
     import re
-    raw = str(raw).replace(",", "").replace("₹", "").replace(" ", "")
-    # If it's a range like 1640-1660, take the midpoint
-    match = re.findall(r"[\d.]+", raw)
-    if not match:
+    nums = re.findall(r"[\d.]+", str(raw).replace(",","").replace("₹","").replace(" ",""))
+    if not nums:
         return 0.0
-    nums = [float(x) for x in match]
-    return sum(nums) / len(nums)
+    return sum(float(x) for x in nums) / len(nums)
 
 
 def _build_options_symbol(trade: dict, leg1: dict) -> str:
-    """
-    Build NSE F&O trading symbol.
-    e.g. NIFTY25APR24500CE
-    """
-    underlying = trade.get("underlying", "NIFTY").upper()
-    expiry_raw = trade.get("expiry", "")
-    strike     = str(leg1.get("strike", "")).replace(",", "").replace(" ", "")
-    opt_type   = leg1.get("type", "CE").upper()
-
-    # Parse expiry to YYMMMDD format
-    # Accepts formats like "24 Apr 2025", "Weekly Apr 24", "Current weekly"
     import re
     from datetime import date
+    underlying = trade.get("underlying", "NIFTY").upper()
+    expiry_raw = trade.get("expiry", "")
+    strike     = str(leg1.get("strike","")).replace(",","").replace(" ","")
+    opt_type   = leg1.get("type","CE").upper()
     months = {"jan":"JAN","feb":"FEB","mar":"MAR","apr":"APR","may":"MAY",
               "jun":"JUN","jul":"JUL","aug":"AUG","sep":"SEP","oct":"OCT",
               "nov":"NOV","dec":"DEC"}
-
     expiry_str = ""
-    expiry_raw_lower = expiry_raw.lower()
-    for mo_key, mo_val in months.items():
-        if mo_key in expiry_raw_lower:
-            year_match = re.search(r"\d{4}", expiry_raw)
-            yr = year_match.group()[-2:] if year_match else str(date.today().year)[-2:]
-            expiry_str = yr + mo_val
+    for mo_k, mo_v in months.items():
+        if mo_k in expiry_raw.lower():
+            yr = re.search(r"\d{4}", expiry_raw)
+            y  = yr.group()[-2:] if yr else str(date.today().year)[-2:]
+            expiry_str = y + mo_v
             break
-
     if not expiry_str:
-        # Default to current month
-        now = datetime.now(IST)
-        expiry_str = now.strftime("%y") + now.strftime("%b").upper()
-
+        from datetime import datetime as dt2
+        import pytz as tz2
+        now2 = dt2.now(tz2.timezone("Asia/Kolkata"))
+        expiry_str = now2.strftime("%y") + now2.strftime("%b").upper()
     return f"{underlying}{expiry_str}{strike}{opt_type}"
 
 
-# ── Confirmation messages ──────────────────────────────────────────────────────
+# ── Execution confirmation messages ───────────────────────────────────────────
 
 def send_execution_confirmation(token: str, chat_id: str,
                                  order_result: dict, trade_id: str):
-    """Send order execution result back to Telegram."""
     if order_result.get("success"):
         text = (
             f"✅ <b>ORDER EXECUTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 Trade ID: <code>{trade_id}</code>\n"
-            f"🏦 Order ID: <code>{order_result.get('order_id','—')}</code>\n"
+            f"📋 <code>{trade_id}</code>\n"
+            f"🏦 Groww Order ID: <code>{order_result.get('order_id','—')}</code>\n"
             f"📝 {order_result.get('message','')}\n"
         )
         if order_result.get("oco_id"):
-            text += f"🔗 OCO (SL+Target): <code>{order_result['oco_id']}</code>\n"
+            text += f"🔗 OCO ID: <code>{order_result['oco_id']}</code>\n"
         text += (
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>Monitor your Groww app for order status.</i>"
+            f"Check your Groww app for order status."
         )
     else:
         text = (
             f"❌ <b>ORDER FAILED</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 Trade ID: <code>{trade_id}</code>\n"
-            f"💥 Error: {order_result.get('message','Unknown error')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Please check your Groww app and place manually if needed."
+            f"📋 <code>{trade_id}</code>\n"
+            f"Error: {order_result.get('message','Unknown')}\n"
+            f"Please place manually in Groww if needed."
         )
     send_telegram_message(token, chat_id, text)
 
 
 def send_rejection_confirmation(token: str, chat_id: str, trade_id: str):
-    """Notify that trade was rejected."""
-    text = (
+    send_telegram_message(token, chat_id,
         f"❌ <b>TRADE REJECTED</b>\n"
-        f"Trade ID <code>{trade_id}</code> was rejected by you.\n"
-        f"No order has been placed."
-    )
-    send_telegram_message(token, chat_id, text)
+        f"<code>{trade_id}</code> — No order placed.")
 
 
 def send_timeout_notification(token: str, chat_id: str, trade_id: str):
-    """Notify that approval window expired."""
-    text = (
-        f"⏰ <b>APPROVAL TIMEOUT</b>\n"
-        f"Trade ID <code>{trade_id}</code> expired with no response.\n"
-        f"No order was placed. The signal may still be valid — check the app."
+    send_telegram_message(token, chat_id,
+        f"⏰ <b>APPROVAL WINDOW EXPIRED</b>\n"
+        f"<code>{trade_id}</code> — No order placed.\n"
+        f"Signal may still be valid. Check the app.")
+
+
+def test_telegram_connection(token: str, chat_id: str) -> bool:
+    result = send_telegram_message(
+        token, chat_id,
+        "✅ <b>HIVE MIND ALPHA</b> — Telegram connected!\n"
+        "Trade alerts with Approve/Reject buttons will appear here."
     )
-    send_telegram_message(token, chat_id, text)
+    return result.get("ok", False)
 
 
-# ── Full orchestration function ────────────────────────────────────────────────
+# ── Legacy blocking function (kept for backward compat, now shorter timeout) ───
 
 def notify_and_await_approval(consensus: dict, groww_token: str,
                                telegram_token: str, telegram_chat_id: str,
-                               approval_timeout: int = 300,
+                               approval_timeout: int = 120,
                                trade_id: str = None) -> dict:
     """
-    Complete flow:
-    1. Send trade alert to Telegram with Approve/Reject buttons
-    2. Wait up to approval_timeout seconds for response
-    3. If approved: execute on Groww, send confirmation
-    4. If rejected/timeout: send notification
-    Returns result dict.
+    Legacy blocking approval. Now deprecated — use send_trade_alert +
+    check_for_approval instead. Kept for backward compatibility with
+    scanner autonomous flow which runs in background thread.
     """
-    import uuid
     if not trade_id:
         trade_id = str(uuid.uuid4())[:8].upper()
 
     eq = consensus.get("equity_trade", {})
     op = consensus.get("options_trade", {})
-
-    has_equity  = eq.get("applicable") and eq.get("direction", "AVOID") != "AVOID"
+    has_equity  = eq.get("applicable") and eq.get("direction","AVOID") != "AVOID"
     has_options = op.get("applicable")
 
     if not has_equity and not has_options:
-        return {"success": False, "message": "No actionable trade in consensus"}
+        return {"success": False, "message": "No actionable trade"}
 
-    trade_type = "both" if (has_equity and has_options) else \
-                 "equity" if has_equity else "options"
+    trade_type = ("both" if (has_equity and has_options)
+                  else "equity" if has_equity else "options")
 
-    # Send alert
-    send_trade_alert(telegram_token, telegram_chat_id, trade_id, consensus, trade_type)
+    alert_info = send_trade_alert(telegram_token, telegram_chat_id,
+                                   trade_id, consensus, trade_type)
+    offset = alert_info.get("offset_before", 0)
 
-    # Poll for approval
-    poller = ApprovalPoller(telegram_token, telegram_chat_id,
-                             trade_id, timeout_seconds=approval_timeout)
-    poller.start()
-    decision = poller.wait_for_decision()
+    # Poll for up to approval_timeout seconds
+    start   = time.time()
+    decision = "timeout"
+    while time.time() - start < approval_timeout:
+        check = check_for_approval(telegram_token, telegram_chat_id,
+                                    trade_id, offset)
+        offset = check.get("new_offset", offset)
+        if check["decision"] in ("approved", "rejected"):
+            decision = check["decision"]
+            break
+        time.sleep(4)
 
     if decision == "approved":
         results = {}
-
         if has_equity:
-            eq["quantity"] = eq.get("quantity", 1)
             r = execute_on_groww(groww_token, eq, "equity")
             results["equity"] = r
             send_execution_confirmation(telegram_token, telegram_chat_id,
                                          r, trade_id + "_EQ")
-
         if has_options:
-            op["quantity"] = op.get("quantity", 1)
             r = execute_on_groww(groww_token, op, "options")
             results["options"] = r
             send_execution_confirmation(telegram_token, telegram_chat_id,
                                          r, trade_id + "_OP")
-
         return {"success": True, "decision": "approved",
                 "trade_id": trade_id, "results": results}
 
@@ -592,18 +497,6 @@ def notify_and_await_approval(consensus: dict, groww_token: str,
         send_rejection_confirmation(telegram_token, telegram_chat_id, trade_id)
         return {"success": True, "decision": "rejected", "trade_id": trade_id}
 
-    else:  # timeout
+    else:
         send_timeout_notification(telegram_token, telegram_chat_id, trade_id)
         return {"success": True, "decision": "timeout", "trade_id": trade_id}
-
-
-# ── Simple test function ───────────────────────────────────────────────────────
-
-def test_telegram_connection(token: str, chat_id: str) -> bool:
-    """Send a test message to verify bot connection."""
-    result = send_telegram_message(
-        token, chat_id,
-        "✅ <b>HIVE MIND ALPHA</b> — Telegram connection confirmed!\n"
-        "You will receive trade alerts here with Approve/Reject buttons."
-    )
-    return result.get("ok", False)
