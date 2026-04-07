@@ -46,6 +46,11 @@ from live_data import (
     get_latest_earnings, get_market_news_today,
     parse_price_from_str,
 )
+from market_data_store import (get_db_stats, backfill_all_instruments,
+                                 get_signal_log, data_coverage)
+from calibrate_signals import run_full_calibration, SIGNAL_NAMES
+from paper_trade import (get_paper_trade_stats, check_open_paper_trades,
+                          when_to_go_live)
 from scanner import get_scanner
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -1673,9 +1678,11 @@ with tab4:
                     def _ctx():
                         from groww_data import build_market_context_groww
                         return build_market_context_groww(groww_tok_sc)
-                    scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc, groww_tok_sc, _ctx)
+                    cap_sc = st.session_state.get("capital", 500000)
+                    scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc,
+                                      groww_tok_sc, _ctx, capital=cap_sc)
                     scanner.start()
-                    st.success("Scanner started! Scans every 15 min during market hours.")
+                    st.success("✅ Scanner started! Quant signals computed across 22 instruments every 15 min.")
                     st.rerun()
             else:
                 if st.button("Stop Scanner", key="sc_stop", use_container_width=True):
@@ -1688,18 +1695,32 @@ with tab4:
                     from groww_data import build_market_context_groww
                     return build_market_context_groww(groww_tok_sc)
                 scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc, groww_tok_sc, _ctx2)
-                with st.spinner("📡 Fetching live data + scanning with all 8 agents…"):
+                cap_now = st.session_state.get("capital", 500000)
+                scanner.configure(api_key_sc, tg_token_sc, tg_chat_sc,
+                                  groww_tok_sc, _ctx2, capital=cap_now)
+                with st.spinner("📐 Computing signals across 22 instruments…"):
                     result = scanner.force_scan()
                 if result.get("fired"):
-                    st.success(f"🎯 Signal: {result.get('direction','')} {result.get('instrument','')} ({result.get('conviction','')}) — check Telegram!")
+                    sigs_sent = result.get("signals_sent", [])
+                    for sig in sigs_sent:
+                        st.success(
+                            f"🎯 **{sig['symbol']}** {sig['direction']} — "
+                            f"P(Win)={sig['probability']:.1%} | "
+                            f"{sig['n_fired']} signals, {sig['n_groups']} groups | "
+                            f"NLP: {sig['nlp_verdict']} → Check Telegram!"
+                        )
                 elif result.get("error"):
                     st.error(f"Error: {result['error']}")
                     st.caption("Verify GROWW_API_TOKEN and ANTHROPIC_API_KEY in Streamlit Secrets.")
                 else:
-                    reason = result.get("reason","")
-                    st.info(f"No signal: {reason[:120]}")
-                    if "Only 0" in reason or "Only 1" in reason:
-                        st.caption("Not enough agents agreed on a direction. Market conditions may be mixed.")
+                    n = result.get("total_scanned", 0)
+                    fired = result.get("fired_count", 0)
+                    regime = result.get("regime", "UNKNOWN")
+                    st.info(f"No signal: {n} instruments scanned, {fired} cleared threshold before NLP filter. Regime: {regime}")
+                    if result.get("top_reasons"):
+                        with st.expander("Why no signals?"):
+                            for sym, reason in result["top_reasons"].items():
+                                st.caption(f"{sym}: {reason}")
         with b3:
             if st.button("Refresh", key="sc_refresh", use_container_width=True):
                 st.rerun()
@@ -1713,12 +1734,14 @@ with tab4:
 with tab5:
     st.markdown('<div style="font-size:13px;color:#6B82B0;margin-bottom:16px;">Backtesting · Agent Performance · Guard · Regime · Smart Money · Sentiment</div>', unsafe_allow_html=True)
 
-    ih1, ih2, ih3, ih4, ih5 = st.tabs([
+    ih1, ih2, ih3, ih4, ih5, ih6, ih7 = st.tabs([
         "📊 Backtest",
         "🏆 Agent Leaderboard",
         "🛡 Guard",
         "🌐 Regime + Sentiment",
         "💰 Smart Money",
+        "🔬 Signal Calibration",
+        "📋 Paper Trading",
     ])
 
     # ── Backtest ───────────────────────────────────────────────────────────────
@@ -2033,3 +2056,204 @@ with tab6:
     </div></div>
     """, unsafe_allow_html=True)
     st.code("# On your VPS:\ngit clone https://github.com/dinumathew/hivemind-alpha.git\ncd hivemind-alpha\nchmod +x deploy_vps.sh\nsudo ./deploy_vps.sh", language="bash")
+
+    # ── Signal Calibration Tab (Action 1) ─────────────────────────────────────
+    with ih6:
+        st.markdown('<div class="sec-label">Signal Calibration Engine — Action 1</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#6B82B0;margin-bottom:16px;">Measures empirical win rates for every signal type against real NSE historical data. Updates the Naive Bayes combiner with measured probabilities instead of assumed priors. Run this after accumulating 6+ months of data.</div>', unsafe_allow_html=True)
+
+        # DB Stats
+        try:
+            db_stats = get_db_stats()
+            s1,s2,s3,s4,s5 = st.columns(5)
+            def dbbox(label, val, color="#1B2A4A"):
+                return (f'<div style="background:#EEF1F8;border:1px solid #C5D0E6;border-top:2px solid {color};border-radius:2px;padding:12px;text-align:center;">'
+                        f'<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">{label}</div>'
+                        f'<div style="font-size:16px;font-weight:600;color:{color};">{val}</div></div>')
+            with s1: st.markdown(dbbox("Daily OHLCV", f"{db_stats.get('daily_ohlcv',0):,}"), unsafe_allow_html=True)
+            with s2: st.markdown(dbbox("PCR Records", f"{db_stats.get('daily_pcr',0):,}"), unsafe_allow_html=True)
+            with s3: st.markdown(dbbox("VIX Records", f"{db_stats.get('daily_vix',0):,}"), unsafe_allow_html=True)
+            with s4: st.markdown(dbbox("FII Records", f"{db_stats.get('daily_fii',0):,}"), unsafe_allow_html=True)
+            with s5: st.markdown(dbbox("Calibrated", f"{db_stats.get('calibrated_win_rates',0)}", "#1A6B3C"), unsafe_allow_html=True)
+            st.caption(f"OHLCV range: {db_stats.get('ohlcv_range','empty')}")
+        except Exception as e:
+            st.warning(f"DB not initialised yet: {e}")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Backfill button
+        ca1, ca2 = st.columns(2)
+        with ca1:
+            if st.button("📥 Backfill 5 Years of Historical Data", key="backfill_btn", use_container_width=True,
+                         help="Fetches 5 years of daily OHLCV for all 22 instruments. Takes 3-5 minutes."):
+                gww_bf = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
+                with st.spinner("Fetching historical data for 22 instruments (3-5 min)…"):
+                    result_bf = backfill_all_instruments(gww_bf, days=1500)
+                st.success(f"✅ Loaded {result_bf['instruments_loaded']} instruments, {result_bf['total_records']:,} records")
+
+        with ca2:
+            holding_d = st.selectbox("Holding Period to Test", [3,5,10], index=1, key="cal_hold",
+                                      format_func=lambda x: f"{x} days")
+
+        # Calibration button
+        if st.button("🔬 Run Full Signal Calibration", key="calibrate_btn", use_container_width=False,
+                     help="Backtests all 13 signals. Requires historical data loaded above."):
+            api_k = st.secrets.get("ANTHROPIC_API_KEY","")
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
+
+            def _progress(sig, i, total):
+                progress_bar.progress(int(i/total*100), text=f"Calibrating {sig}…")
+                status_text.text(f"Signal {i+1}/{total}: {sig}")
+
+            with st.spinner("Running walk-forward calibration…"):
+                cal_result = run_full_calibration(
+                    groww_token    = st.secrets.get("GROWW_API_TOKEN",""),
+                    holding_days   = holding_d,
+                    progress_callback = _progress,
+                )
+            progress_bar.progress(100, text="Complete")
+
+            if cal_result.get("error"):
+                st.error(cal_result["error"])
+                st.info("Run 'Backfill 5 Years of Historical Data' first.")
+            else:
+                st.success(f"✅ Calibrated {cal_result['signals_tested']} signals on "
+                            f"{cal_result['instruments_used']} instruments")
+
+                # Show results table
+                results = cal_result.get("results",{})
+                if results:
+                    st.markdown('<div class="sec-label">Calibration Results</div>', unsafe_allow_html=True)
+                    for sig, r in sorted(results.items(), key=lambda x: x[1].get("win_rate_test",0), reverse=True):
+                        grade = r.get("grade","?")
+                        gc    = {"A+":"#1A6B3C","A":"#1A6B3C","B":"#8B6914","C":"#6B82B0","D":"#8B1A1A"}.get(grade,"#6B82B0")
+                        wr_all  = r.get("win_rate_all",0.5)
+                        wr_test = r.get("win_rate_test",0.5)
+                        n_all   = r.get("n_all",0)
+                        n_test  = r.get("n_test",0)
+                        rel     = r.get("reliable", False)
+                        st.markdown(
+                            f'<div style="display:flex;justify-content:space-between;padding:8px 14px;'
+                            f'background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {gc};'
+                            f'border-radius:2px;margin-bottom:4px;flex-wrap:wrap;gap:8px;">'
+                            f'<span style="font-weight:700;color:#1B2A4A;font-size:13px;">{sig}</span>'
+                            f'<span style="color:{gc};font-weight:700;">Grade {grade}</span>'
+                            f'<span style="color:#6B82B0;font-size:12px;">All: {wr_all:.1%} (n={n_all})</span>'
+                            f'<span style="color:{"#1A6B3C" if wr_test>0.55 else "#8B1A1A"};font-size:12px;font-weight:700;">'
+                            f'Out-of-sample: {wr_test:.1%} (n={n_test})</span>'
+                            f'<span style="font-size:11px;color:{"#1A6B3C" if rel else "#9B9B9B"};">'
+                            f'{"✓ Reliable" if rel else "⚠ Needs more data"}</span>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
+                    st.markdown('<div style="background:#EBF5F0;border:1px solid #A8D4BC;border-radius:2px;padding:10px 14px;font-size:12px;color:#1A6B3C;margin-top:8px;">✓ Win rates have been updated in the Naive Bayes combiner. Future signals will use measured probabilities.</div>', unsafe_allow_html=True)
+
+    # ── Paper Trading Tab (Action 2) ───────────────────────────────────────────
+    with ih7:
+        st.markdown('<div class="sec-label">Paper Trading Track Record — Action 2</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#6B82B0;margin-bottom:16px;">Every scanner signal is automatically recorded as a paper trade. Daily outcome checks determine whether each signal hit its target or stop-loss. After 50 trades you have statistical evidence of whether the system has a real edge.</div>', unsafe_allow_html=True)
+
+        pt_col1, pt_col2 = st.columns([3,1])
+        with pt_col2:
+            if st.button("🔄 Check Open Trades", key="pt_check", use_container_width=True,
+                         help="Runs the daily outcome checker on all open paper trades"):
+                with st.spinner("Checking outcomes…"):
+                    resolved = check_open_paper_trades(st.secrets.get("GROWW_API_TOKEN",""))
+                st.success(f"✅ Resolved {resolved} trades")
+                st.rerun()
+
+        # Stats
+        try:
+            pt_stats = get_paper_trade_stats(days=180)
+
+            if pt_stats.get("n_closed", 0) == 0:
+                st.info("No completed paper trades yet. Scanner signals will automatically appear here once they close (SL hit, target hit, or 10-day time exit).")
+            else:
+                n_closed = pt_stats["n_closed"]
+                n_open   = pt_stats.get("n_open", 0)
+                wr       = pt_stats.get("win_rate",0)
+                ci_l     = pt_stats.get("ci_low",0)
+                ci_h     = pt_stats.get("ci_high",0)
+                exp      = pt_stats.get("expectancy",0)
+                sharpe   = pt_stats.get("sharpe",0)
+                grade    = pt_stats.get("grade","?")
+                gc2      = {"A+":"#1A6B3C","A":"#1A6B3C","B":"#8B6914","C":"#6B82B0","D":"#8B1A1A"}.get(grade,"#6B82B0")
+
+                # KPI row
+                p1,p2,p3,p4,p5,p6 = st.columns(6)
+                def ptbox(label,val,color="#1B2A4A"):
+                    return (f'<div style="background:#EEF1F8;border:1px solid #C5D0E6;border-top:2px solid {color};border-radius:2px;padding:12px;text-align:center;">'
+                            f'<div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#6B82B0;margin-bottom:4px;">{label}</div>'
+                            f'<div style="font-size:18px;font-weight:600;color:{color};">{val}</div></div>')
+                with p1: st.markdown(ptbox("Closed",  str(n_closed)), unsafe_allow_html=True)
+                with p2: st.markdown(ptbox("Open",    str(n_open), "#8B6914"), unsafe_allow_html=True)
+                with p3: st.markdown(ptbox("Win Rate", f"{wr:.1%}", "#1A6B3C" if wr>0.55 else "#8B1A1A"), unsafe_allow_html=True)
+                with p4: st.markdown(ptbox("95% CI",  f"{ci_l:.0%}–{ci_h:.0%}"), unsafe_allow_html=True)
+                with p5: st.markdown(ptbox("Expectancy", f"{exp:.2f}%", "#1A6B3C" if exp>0 else "#8B1A1A"), unsafe_allow_html=True)
+                with p6: st.markdown(ptbox("Grade", grade, gc2), unsafe_allow_html=True)
+
+                st.markdown(f'<div style="background:#EEF1F8;border:1px solid #C5D0E6;border-radius:2px;padding:10px 14px;font-size:12px;color:#1B2A4A;margin:12px 0;">{pt_stats.get("message","")}</div>', unsafe_allow_html=True)
+
+                # Go-live readiness
+                readiness = when_to_go_live(pt_stats)
+                rec_color = "#1A6B3C" if readiness["all_met"] else "#8B6914" if readiness["criteria_met"]>=3 else "#8B1A1A"
+                st.markdown(f'<div style="background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {rec_color};border-radius:2px;padding:12px 16px;margin-bottom:14px;font-size:13px;font-weight:600;color:{rec_color};">{readiness["recommendation"]}</div>', unsafe_allow_html=True)
+
+                # Criteria checklist
+                st.markdown('<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;">', unsafe_allow_html=True)
+                for crit_name, crit in readiness["criteria"].items():
+                    c_col = "#1A6B3C" if crit["met"] else "#8B1A1A"
+                    c_icon = "✓" if crit["met"] else "✗"
+                    st.markdown(
+                        f'<div style="background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {c_col};border-radius:2px;padding:8px 12px;font-size:12px;">'
+                        f'<span style="color:{c_col};font-weight:700;">{c_icon}</span> {crit["label"]}<br>'
+                        f'<span style="color:#6B82B0;font-size:11px;">Current: {crit["value"]} | Required: {crit["required"]}</span></div>',
+                        unsafe_allow_html=True
+                    )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                # Per-signal breakdown
+                if pt_stats.get("per_signal"):
+                    st.markdown('<div class="sec-label">Per-Signal Win Rates (live measured)</div>', unsafe_allow_html=True)
+                    for sig, sr in sorted(pt_stats["per_signal"].items(), key=lambda x: x[1]["win_rate"], reverse=True):
+                        wr_sig = sr["win_rate"]; n_sig = sr["n"]
+                        wr_c   = "#1A6B3C" if wr_sig > 0.55 else "#8B1A1A" if wr_sig < 0.45 else "#8B6914"
+                        st.markdown(
+                            f'<div style="display:flex;justify-content:space-between;padding:6px 12px;'
+                            f'background:#F8F9FC;border:1px solid #DCE1EC;border-radius:2px;margin-bottom:3px;">'
+                            f'<span style="font-size:12px;color:#1B2A4A;">{sig}</span>'
+                            f'<span style="font-size:12px;font-weight:700;color:{wr_c};">{wr_sig:.1%}</span>'
+                            f'<span style="font-size:11px;color:#9B9B9B;">n={n_sig}</span>'
+                            f'<span style="font-size:11px;color:#6B82B0;">avg={sr["avg_pnl"]:.2f}%</span></div>',
+                            unsafe_allow_html=True
+                        )
+
+                # Recent trade log
+                try:
+                    recent_log = get_signal_log(days=30)
+                    if recent_log:
+                        st.markdown('<div class="sec-label">Recent Paper Trades</div>', unsafe_allow_html=True)
+                        for t in recent_log[:15]:
+                            won_color = "#1A6B3C" if t.get("won") else "#8B1A1A" if t.get("won") is not None else "#8B6914"
+                            outcome_label = ("WIN" if t.get("won") else "LOSS" if t.get("won") is not None else "OPEN")
+                            pnl_str = f"{t['pnl_pct']:+.2f}%" if t.get("pnl_pct") is not None else "—"
+                            st.markdown(
+                                f'<div style="display:flex;justify-content:space-between;padding:6px 14px;'
+                                f'background:#F8F9FC;border:1px solid #DCE1EC;border-left:3px solid {won_color};'
+                                f'border-radius:2px;margin-bottom:3px;flex-wrap:wrap;gap:6px;">'
+                                f'<span style="font-weight:700;font-size:12px;color:#1B2A4A;">{t.get("symbol","?")}</span>'
+                                f'<span style="font-size:11px;color:#6B82B0;">{t.get("direction","?")}</span>'
+                                f'<span style="font-size:11px;color:#6B82B0;">P={t.get("probability",0):.0%}</span>'
+                                f'<span style="font-size:11px;color:{won_color};font-weight:700;">{outcome_label}</span>'
+                                f'<span style="font-size:11px;color:{won_color};">{pnl_str}</span>'
+                                f'<span style="font-size:10px;color:#9B9B9B;">{str(t.get("fired_at",""))[:10]}</span>'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            st.error(f"Error loading paper trade stats: {e}")
