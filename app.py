@@ -2087,9 +2087,24 @@ with tab6:
             if st.button("📥 Backfill 5 Years of Historical Data", key="backfill_btn", use_container_width=True,
                          help="Fetches 5 years of daily OHLCV for all 22 instruments. Takes 3-5 minutes."):
                 gww_bf = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
-                with st.spinner("Fetching historical data for 22 instruments (3-5 min)…"):
+                with st.spinner("Fetching historical data for 22 instruments — fetching in yearly chunks (5-10 min)…"):
                     result_bf = backfill_all_instruments(gww_bf, days=1500)
-                st.success(f"✅ Loaded {result_bf['instruments_loaded']} instruments, {result_bf['total_records']:,} records")
+                loaded = result_bf['instruments_loaded']
+                records = result_bf['total_records']
+                if loaded > 0:
+                    st.success(f"✅ Loaded {loaded} instruments, {records:,} records")
+                else:
+                    st.error("0 instruments loaded. Showing per-instrument errors:")
+                    for sym, r in result_bf.get("details", {}).items():
+                        if r.get("error"):
+                            st.caption(f"{sym}: {r['error']}")
+                # Show successful ones too
+                with st.expander(f"Details ({loaded} loaded)"):
+                    for sym, r in result_bf.get("details", {}).items():
+                        if r.get("inserted", 0) > 0:
+                            st.caption(f"✓ {sym}: {r['inserted']} records ({r.get('date_range','')})")
+                        else:
+                            st.caption(f"✗ {sym}: {r.get('error','failed')}")
 
         with ca2:
             holding_d = st.selectbox("Holding Period to Test", [3,5,10], index=1, key="cal_hold",

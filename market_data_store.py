@@ -566,37 +566,93 @@ def backfill_instrument(symbol: str, groww_token: str = "",
                          days: int = 1500) -> dict:
     """
     Backfill historical daily OHLCV for one instrument.
+    NSE API has a ~365 day limit per request, so we fetch in yearly chunks.
     1500 days ≈ 6 years of trading data.
-    Tries Groww API first, falls back to NSE.
-    Returns {symbol, inserted, total_days, source}.
     """
-    from live_data import get_historical_ohlcv_nse, get_historical_ohlcv_groww
+    from live_data import get_historical_ohlcv_groww
+    from datetime import date, timedelta
+    import requests
 
-    candles = []
-    source  = "NSE"
+    all_candles = []
+    source      = "NSE"
+    seen_dates  = set()
 
+    # Try Groww first (single call, handles long ranges)
     if groww_token:
-        result = get_historical_ohlcv_groww(groww_token, symbol, "1d", days)
-        if result.get("success") and result.get("candles"):
-            candles = result["candles"]
-            source  = "GROWW"
+        try:
+            result = get_historical_ohlcv_groww(groww_token, symbol, "1d", days)
+            if result.get("success") and len(result.get("candles", [])) > 50:
+                all_candles = result["candles"]
+                source      = "GROWW"
+        except Exception:
+            pass
 
-    if not candles:
-        result = get_historical_ohlcv_nse(symbol, days)
-        if result.get("success"):
-            candles = result.get("candles", [])
+    # NSE fallback — fetch in 365-day chunks to avoid API limit
+    if not all_candles:
+        source    = "NSE"
+        end_dt    = date.today()
+        start_dt  = end_dt - timedelta(days=days)
+        headers   = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.nseindia.com/",
+        }
+        session = requests.Session()
+        session.headers.update(headers)
+        try:
+            session.get("https://www.nseindia.com", timeout=8)
+        except Exception:
+            pass
 
-    if not candles:
-        return {"symbol": symbol, "inserted": 0, "error": "No data fetched"}
+        # Walk backwards in 300-day chunks (NSE limit ~365, use 300 to be safe)
+        chunk_end = end_dt
+        while chunk_end > start_dt:
+            chunk_start = max(chunk_end - timedelta(days=300), start_dt)
+            try:
+                url = (
+                    f"https://www.nseindia.com/api/historical/securityArchives"
+                    f"?from={chunk_start.strftime('%d-%m-%Y')}"
+                    f"&to={chunk_end.strftime('%d-%m-%Y')}"
+                    f"&symbol={symbol.upper()}&dataType=priceVolumeDeliverable"
+                    f"&series=EQ"
+                )
+                r    = session.get(url, timeout=15)
+                data = r.json().get("data", [])
+                for d in data:
+                    dt_str = d.get("CH_TIMESTAMP", "")[:10]
+                    if dt_str and dt_str not in seen_dates:
+                        seen_dates.add(dt_str)
+                        try:
+                            all_candles.append({
+                                "datetime":    dt_str,
+                                "open":         float(d.get("CH_OPENING_PRICE", 0) or 0),
+                                "high":         float(d.get("CH_TRADE_HIGH_PRICE", 0) or 0),
+                                "low":          float(d.get("CH_TRADE_LOW_PRICE", 0) or 0),
+                                "close":        float(d.get("CH_CLOSING_PRICE", 0) or 0),
+                                "volume":       int(d.get("CH_TOT_TRADED_QTY", 0) or 0),
+                                "delivery_pct": float(d.get("COP_DELIV_PERC", 0) or 0),
+                            })
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            chunk_end = chunk_start - timedelta(days=1)
+            import time; time.sleep(0.3)   # Polite rate limiting
 
-    inserted = upsert_daily_ohlcv(symbol, candles, source)
+        # Sort chronologically
+        all_candles.sort(key=lambda x: x["datetime"])
+
+    if not all_candles:
+        return {"symbol": symbol, "inserted": 0, "error": "No data returned from NSE or Groww"}
+
+    inserted = upsert_daily_ohlcv(symbol, all_candles, source)
     return {
         "symbol":      symbol,
         "inserted":    inserted,
-        "total_days":  len(candles),
+        "total_days":  len(all_candles),
         "source":      source,
-        "date_range":  (f"{candles[0].get('datetime','?')[:10]} → "
-                        f"{candles[-1].get('datetime','?')[:10]}"),
+        "date_range":  (f"{all_candles[0].get('datetime','?')[:10]} → "
+                        f"{all_candles[-1].get('datetime','?')[:10]}"),
     }
 
 
