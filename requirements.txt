@@ -12,9 +12,7 @@ requests>=2.31.0
 lxml>=5.0.0
 beautifulsoup4>=4.12.0
 feedparser>=6.0.0
+yfinance>=0.2.40
 
 # Analytics
 numpy>=1.26.0
-
-# Notifications
-# python-telegram-bot not needed — using raw requests

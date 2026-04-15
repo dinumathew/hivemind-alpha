@@ -565,21 +565,33 @@ def data_coverage(symbol: str) -> dict:
 def backfill_instrument(symbol: str, groww_token: str = "",
                          days: int = 1500) -> dict:
     """
-    Backfill historical daily OHLCV for one instrument.
-    NSE API has a ~365 day limit per request, so we fetch in yearly chunks.
-    1500 days ≈ 6 years of trading data.
+    Backfill historical daily OHLCV using yfinance (Yahoo Finance).
+
+    Why yfinance instead of NSE direct API:
+    - NSE blocks cloud hosting IPs (Streamlit Cloud, DigitalOcean, AWS)
+    - Yahoo Finance serves NSE data reliably from any IP
+    - Returns up to 10 years of daily OHLCV for NSE/BSE symbols
+    - Symbol format: RELIANCE.NS, HDFCBANK.NS, ^NSEI (Nifty), ^NSEBANK
+
+    yfinance is already in requirements.txt.
     """
-    from live_data import get_historical_ohlcv_groww
     from datetime import date, timedelta
-    import requests
+    import time
+
+    # Symbol mapping for yfinance
+    INDEX_MAP = {
+        "NIFTY":     "^NSEI",
+        "BANKNIFTY": "^NSEBANK",
+        "SENSEX":    "^BSESN",
+    }
 
     all_candles = []
-    source      = "NSE"
-    seen_dates  = set()
+    source      = "YAHOO"
 
-    # Try Groww first (single call, handles long ranges)
+    # Try Groww first if token available
     if groww_token:
         try:
+            from live_data import get_historical_ohlcv_groww
             result = get_historical_ohlcv_groww(groww_token, symbol, "1d", days)
             if result.get("success") and len(result.get("candles", [])) > 50:
                 all_candles = result["candles"]
@@ -587,63 +599,59 @@ def backfill_instrument(symbol: str, groww_token: str = "",
         except Exception:
             pass
 
-    # NSE fallback — fetch in 365-day chunks to avoid API limit
+    # yfinance fallback (works from any server including Streamlit Cloud)
     if not all_candles:
-        source    = "NSE"
-        end_dt    = date.today()
-        start_dt  = end_dt - timedelta(days=days)
-        headers   = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.nseindia.com/",
-        }
-        session = requests.Session()
-        session.headers.update(headers)
         try:
-            session.get("https://www.nseindia.com", timeout=8)
-        except Exception:
-            pass
+            import yfinance as yf
+            from datetime import datetime as dt2
 
-        # Walk backwards in 300-day chunks (NSE limit ~365, use 300 to be safe)
-        chunk_end = end_dt
-        while chunk_end > start_dt:
-            chunk_start = max(chunk_end - timedelta(days=300), start_dt)
-            try:
-                url = (
-                    f"https://www.nseindia.com/api/historical/securityArchives"
-                    f"?from={chunk_start.strftime('%d-%m-%Y')}"
-                    f"&to={chunk_end.strftime('%d-%m-%Y')}"
-                    f"&symbol={symbol.upper()}&dataType=priceVolumeDeliverable"
-                    f"&series=EQ"
-                )
-                r    = session.get(url, timeout=15)
-                data = r.json().get("data", [])
-                for d in data:
-                    dt_str = d.get("CH_TIMESTAMP", "")[:10]
-                    if dt_str and dt_str not in seen_dates:
-                        seen_dates.add(dt_str)
-                        try:
-                            all_candles.append({
-                                "datetime":    dt_str,
-                                "open":         float(d.get("CH_OPENING_PRICE", 0) or 0),
-                                "high":         float(d.get("CH_TRADE_HIGH_PRICE", 0) or 0),
-                                "low":          float(d.get("CH_TRADE_LOW_PRICE", 0) or 0),
-                                "close":        float(d.get("CH_CLOSING_PRICE", 0) or 0),
-                                "volume":       int(d.get("CH_TOT_TRADED_QTY", 0) or 0),
-                                "delivery_pct": float(d.get("COP_DELIV_PERC", 0) or 0),
-                            })
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            chunk_end = chunk_start - timedelta(days=1)
-            import time; time.sleep(0.3)   # Polite rate limiting
+            sym_upper = symbol.upper()
+            yf_sym    = INDEX_MAP.get(sym_upper, f"{sym_upper}.NS")
 
-        # Sort chronologically
-        all_candles.sort(key=lambda x: x["datetime"])
+            end_dt   = date.today()
+            start_dt = end_dt - timedelta(days=days)
+
+            ticker = yf.Ticker(yf_sym)
+            df     = ticker.history(
+                start  = start_dt.strftime("%Y-%m-%d"),
+                end    = end_dt.strftime("%Y-%m-%d"),
+                interval = "1d",
+                auto_adjust = True,
+                actions  = False,
+            )
+
+            if df is None or df.empty:
+                return {"symbol": symbol, "inserted": 0,
+                        "error": f"yfinance returned empty data for {yf_sym}"}
+
+            for idx, row in df.iterrows():
+                dt_str = str(idx)[:10]
+                try:
+                    all_candles.append({
+                        "datetime":    dt_str,
+                        "open":        round(float(row["Open"]),  2),
+                        "high":        round(float(row["High"]),  2),
+                        "low":         round(float(row["Low"]),   2),
+                        "close":       round(float(row["Close"]), 2),
+                        "volume":      int(row["Volume"]),
+                        "delivery_pct": 50.0,   # Not available from Yahoo
+                    })
+                except Exception:
+                    pass
+
+            all_candles.sort(key=lambda x: x["datetime"])
+            source = "YAHOO"
+
+        except ImportError:
+            return {"symbol": symbol, "inserted": 0,
+                    "error": "yfinance not installed. Add to requirements.txt"}
+        except Exception as e:
+            return {"symbol": symbol, "inserted": 0,
+                    "error": f"yfinance error: {str(e)[:100]}"}
 
     if not all_candles:
-        return {"symbol": symbol, "inserted": 0, "error": "No data returned from NSE or Groww"}
+        return {"symbol": symbol, "inserted": 0,
+                "error": "No data returned from any source"}
 
     inserted = upsert_daily_ohlcv(symbol, all_candles, source)
     return {

@@ -425,19 +425,64 @@ def get_historical_ohlcv_groww(token: str, symbol: str,
 
 def get_historical_ohlcv_nse(symbol: str, days: int = 60) -> dict:
     """
-    Fallback: Fetch historical daily OHLCV from NSE (free, no API key).
+    Fetch historical daily OHLCV.
+    Uses yfinance (Yahoo Finance) as primary source — works from any server.
+    NSE direct API is blocked on cloud hosting IPs (Streamlit, DigitalOcean, AWS).
     """
+    INDEX_MAP = {
+        "NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN",
+    }
+    sym_upper = symbol.upper()
+    yf_sym    = INDEX_MAP.get(sym_upper, f"{sym_upper}.NS")
+
+    # Try yfinance first (always works from cloud)
+    try:
+        import yfinance as yf
+        end_dt   = date.today()
+        start_dt = end_dt - timedelta(days=days)
+        ticker   = yf.Ticker(yf_sym)
+        df       = ticker.history(
+            start       = start_dt.strftime("%Y-%m-%d"),
+            end         = end_dt.strftime("%Y-%m-%d"),
+            interval    = "1d",
+            auto_adjust = True,
+            actions     = False,
+        )
+        if df is not None and not df.empty:
+            candles = []
+            for idx, row in df.iterrows():
+                try:
+                    candles.append({
+                        "datetime":    str(idx)[:10],
+                        "open":        round(float(row["Open"]),  2),
+                        "high":        round(float(row["High"]),  2),
+                        "low":         round(float(row["Low"]),   2),
+                        "close":       round(float(row["Close"]), 2),
+                        "volume":      int(row["Volume"]),
+                        "delivery_pct": 50.0,
+                    })
+                except Exception:
+                    pass
+            candles.sort(key=lambda x: x["datetime"])
+            if candles:
+                return {
+                    "success": True, "symbol": sym_upper,
+                    "interval": "1d", "candles": candles,
+                    "count": len(candles), "source": "YAHOO",
+                }
+    except Exception:
+        pass
+
+    # NSE direct fallback (works on VPS with Indian IP, not on cloud)
     try:
         session  = _nse_session()
         end_dt   = date.today()
-        start_dt = end_dt - timedelta(days=days)
-
+        start_dt = end_dt - timedelta(days=min(days, 300))
         r = session.get(
             f"https://www.nseindia.com/api/historical/securityArchives"
             f"?from={start_dt.strftime('%d-%m-%Y')}"
             f"&to={end_dt.strftime('%d-%m-%Y')}"
-            f"&symbol={symbol.upper()}&dataType=priceVolumeDeliverable"
-            f"&series=EQ",
+            f"&symbol={sym_upper}&dataType=priceVolumeDeliverable&series=EQ",
             timeout=10,
         )
         data = r.json().get("data", [])
@@ -445,28 +490,24 @@ def get_historical_ohlcv_nse(symbol: str, days: int = 60) -> dict:
         for d in data:
             try:
                 candles.append({
-                    "datetime": d.get("CH_TIMESTAMP",""),
-                    "open":     float(d.get("CH_OPENING_PRICE", 0) or 0),
-                    "high":     float(d.get("CH_TRADE_HIGH_PRICE", 0) or 0),
-                    "low":      float(d.get("CH_TRADE_LOW_PRICE", 0) or 0),
-                    "close":    float(d.get("CH_CLOSING_PRICE", 0) or 0),
-                    "volume":   int(d.get("CH_TOT_TRADED_QTY", 0) or 0),
-                    "delivery_pct": float(d.get("COP_DELIV_PERC", 0) or 0),
+                    "datetime":    d.get("CH_TIMESTAMP","")[:10],
+                    "open":        float(d.get("CH_OPENING_PRICE", 0) or 0),
+                    "high":        float(d.get("CH_TRADE_HIGH_PRICE", 0) or 0),
+                    "low":         float(d.get("CH_TRADE_LOW_PRICE", 0) or 0),
+                    "close":       float(d.get("CH_CLOSING_PRICE", 0) or 0),
+                    "volume":      int(d.get("CH_TOT_TRADED_QTY", 0) or 0),
+                    "delivery_pct":float(d.get("COP_DELIV_PERC", 0) or 0),
                 })
             except Exception:
                 pass
+        candles.reverse()
+        if candles:
+            return {"success": True, "symbol": sym_upper, "interval": "1d",
+                    "candles": candles, "count": len(candles), "source": "NSE"}
+    except Exception:
+        pass
 
-        candles.reverse()  # Chronological order
-        return {
-            "success": True,
-            "symbol":  symbol.upper(),
-            "interval":"1d",
-            "candles": candles,
-            "count":   len(candles),
-            "source":  "NSE",
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e), "candles": []}
+    return {"success": False, "error": "Could not fetch from Yahoo or NSE", "candles": []}
 
 
 def compute_technicals(candles: list) -> dict:
