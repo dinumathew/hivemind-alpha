@@ -2087,7 +2087,7 @@ with tab6:
             if st.button("📥 Backfill 5 Years of Historical Data", key="backfill_btn", use_container_width=True,
                          help="Fetches 5 years of daily OHLCV for all 22 instruments. Takes 3-5 minutes."):
                 gww_bf = st.secrets.get("GROWW_API_TOKEN","") or st.session_state.get("groww_token","")
-                with st.spinner("Fetching historical data for 22 instruments — fetching in yearly chunks (5-10 min)…"):
+                with st.spinner("Fetching 5 years of data for 22 instruments (~45-60 seconds — sequential to avoid rate limits)…"):
                     result_bf = backfill_all_instruments(gww_bf, days=1500)
                 loaded = result_bf['instruments_loaded']
                 records = result_bf['total_records']

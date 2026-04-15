@@ -666,23 +666,26 @@ def backfill_instrument(symbol: str, groww_token: str = "",
 
 def backfill_all_instruments(groww_token: str = "", days: int = 1500) -> dict:
     """
-    Backfill all 22 instruments. Run once on VPS deployment.
-    Takes 3-5 minutes total.
+    Backfill all 22 instruments sequentially.
+
+    Why sequential (not parallel):
+    yfinance/Yahoo Finance rate-limits concurrent requests from the same IP.
+    Sequential with a 1-second pause between instruments avoids throttling.
+    Total time: ~45-60 seconds for 22 instruments.
     """
-    import concurrent.futures
+    import time
     from scanner import SCAN_UNIVERSE
 
     all_symbols = SCAN_UNIVERSE["stocks"] + SCAN_UNIVERSE["indices"]
     results = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {ex.submit(backfill_instrument, sym, groww_token, days): sym
-                for sym in all_symbols}
-        for fut, sym in futs.items():
-            try:
-                results[sym] = fut.result(timeout=60)
-            except Exception as e:
-                results[sym] = {"symbol": sym, "error": str(e)}
+    for sym in all_symbols:
+        try:
+            results[sym] = backfill_instrument(sym, groww_token, days)
+        except Exception as e:
+            results[sym] = {"symbol": sym, "inserted": 0, "error": str(e)}
+        # Rate limit pause — Yahoo Finance throttles concurrent requests
+        time.sleep(1.2)
 
     total_inserted = sum(r.get("inserted", 0) for r in results.values())
     success_count  = sum(1 for r in results.values() if r.get("inserted", 0) > 0)
